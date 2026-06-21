@@ -1,0 +1,977 @@
+#!/usr/bin/env bash
+#
+# ijsi - JetBrains shared indexes local manager
+#
+# Generates/serves JetBrains "shared indexes" for your projects so that opening
+# a project in PhpStorm/WebStorm/GoLand/DataGrip does not re-index from scratch.
+#
+# Highlights vs. the original:
+#   * FIXED: `refresh` no longer re-indexes everything on every run. The old
+#     fingerprint hashed IDE-managed files under .idea/ (workspace.xml, misc.xml,
+#     modules.xml, *.iml ...). The indexer rewrites those on every run, so the
+#     fingerprint could never match and projects re-indexed forever. The
+#     fingerprint now uses only inputs the indexer does NOT mutate.
+#   * Persistent config file (~/.config/ijsi/config), editable from the TUI.
+#   * Boxed terminal GUI (whiptail/dialog): menus, project checklists, live
+#     progress gauge, config editor, log viewer.
+#   * IDE homes auto-detected from JetBrains Toolbox (no hardcoded paths).
+#   * `refresh --force` / `--only name,...`, summaries, log pruning, doctor.
+#
+# Run with no arguments to open the GUI. Run `ijsi help` for the CLI.
+
+set -uo pipefail
+
+IJSI_VERSION="2.0.0"
+
+SELF="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+
+# ---------------------------------------------------------------------------
+# Configuration (defaults < config file < IJSI_* environment overrides)
+# ---------------------------------------------------------------------------
+
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}/ijsi"
+CONFIG_FILE="${IJSI_CONFIG:-$CONFIG_HOME/config}"
+
+DEFAULT_PORT=25561
+DEFAULT_CACHE_DIR="$HOME/.cache/ij-shared-indexes"
+DEFAULT_TOOLBOX_APPS="$HOME/.local/share/JetBrains/Toolbox/apps"
+DEFAULT_REFRESH_INTERVAL="2h"
+DEFAULT_PROJECT_ROOTS=(
+  "$HOME/PhpstormProjects"
+  "$HOME/WebstormProjects"
+  "$HOME/GoLandProjects"
+  "$HOME/DatagripProjects"
+)
+
+# These may be set by the config file; left empty here so env/defaults can win.
+PORT="" ; CACHE_DIR="" ; CLI="" ; TOOLBOX_APPS="" ; REFRESH_INTERVAL=""
+PHPSTORM_IDE="" ; WEBSTORM_IDE="" ; DATAGRIP_IDE="" ; GOLAND_IDE=""
+PROJECT_ROOTS=()
+EXTRA_PROJECTS=()
+
+load_config() {
+  if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+  fi
+}
+
+apply_env_and_defaults() {
+  CLI="${IJSI_CLI:-${CLI:-ij-shared-indexes-tool-cli}}"
+  PORT="${IJSI_PORT:-${PORT:-$DEFAULT_PORT}}"
+  CACHE_DIR="${IJSI_CACHE_DIR:-${CACHE_DIR:-$DEFAULT_CACHE_DIR}}"
+  TOOLBOX_APPS="${IJSI_TOOLBOX_APPS:-${TOOLBOX_APPS:-$DEFAULT_TOOLBOX_APPS}}"
+  REFRESH_INTERVAL="${IJSI_REFRESH_INTERVAL:-${REFRESH_INTERVAL:-$DEFAULT_REFRESH_INTERVAL}}"
+  BASE_URL="${IJSI_BASE_URL:-http://127.0.0.1:${PORT}}"
+
+  DATA_DIR="$CACHE_DIR/tool-data"
+  STATE_DIR="$CACHE_DIR/state"
+  LOG_DIR="$CACHE_DIR/logs"
+  CONFIG_DIR="$CACHE_DIR/configs"
+  SYSTEMD_DIR="$HOME/.config/systemd/user"
+
+  if [[ ${#PROJECT_ROOTS[@]} -eq 0 ]]; then
+    PROJECT_ROOTS=( "${DEFAULT_PROJECT_ROOTS[@]}" )
+  fi
+
+  # Raw IDE settings: "auto" (detect) or an absolute install dir.
+  PHPSTORM_IDE="${IJSI_PHPSTORM_IDE:-${PHPSTORM_IDE:-auto}}"
+  WEBSTORM_IDE="${IJSI_WEBSTORM_IDE:-${WEBSTORM_IDE:-auto}}"
+  DATAGRIP_IDE="${IJSI_DATAGRIP_IDE:-${DATAGRIP_IDE:-auto}}"
+  GOLAND_IDE="${IJSI_GOLAND_IDE:-${GOLAND_IDE:-auto}}"
+
+  # Resolved install dirs actually passed to the CLI.
+  PHPSTORM_HOME="$(resolve_ide "$PHPSTORM_IDE" phpstorm.sh)"
+  WEBSTORM_HOME="$(resolve_ide "$WEBSTORM_IDE" webstorm.sh)"
+  DATAGRIP_HOME="$(resolve_ide "$DATAGRIP_IDE" datagrip.sh)"
+  GOLAND_HOME="$(resolve_ide "$GOLAND_IDE" goland.sh)"
+}
+
+resolve_ide() {
+  local configured="$1" launcher="$2"
+
+  if [[ -n "$configured" && "$configured" != "auto" ]]; then
+    printf '%s' "$configured"
+    return 0
+  fi
+
+  local r found=""
+  for r in "$TOOLBOX_APPS" "$HOME/.local/share/JetBrains" "/opt"; do
+    [[ -d "$r" ]] || continue
+    found="$(find "$r" -maxdepth 8 -type f -name "$launcher" 2>/dev/null | sort -V | tail -n 1)"
+    if [[ -n "$found" ]]; then
+      printf '%s' "$(dirname "$(dirname "$found")")"
+      return 0
+    fi
+  done
+  printf ''
+}
+
+ensure_dirs() {
+  mkdir -p "$CONFIG_HOME" "$DATA_DIR" "$STATE_DIR" "$LOG_DIR" "$CONFIG_DIR"
+}
+
+save_config() {
+  mkdir -p "$CONFIG_HOME"
+  {
+    printf '# ijsi configuration  -  sourced as bash. IJSI_* env vars override these.\n'
+    printf '# Edit by hand, or via:  ijsi  ->  Configure\n\n'
+    printf 'PORT=%q\n' "$PORT"
+    printf 'CACHE_DIR=%q\n' "$CACHE_DIR"
+    printf 'CLI=%q\n' "$CLI"
+    printf 'TOOLBOX_APPS=%q\n' "$TOOLBOX_APPS"
+    printf 'REFRESH_INTERVAL=%q\n\n' "$REFRESH_INTERVAL"
+    printf '# IDE install dir: "auto" detects from Toolbox, or set an absolute path.\n'
+    printf 'PHPSTORM_IDE=%q\n' "$PHPSTORM_IDE"
+    printf 'WEBSTORM_IDE=%q\n' "$WEBSTORM_IDE"
+    printf 'DATAGRIP_IDE=%q\n' "$DATAGRIP_IDE"
+    printf 'GOLAND_IDE=%q\n\n' "$GOLAND_IDE"
+    printf 'PROJECT_ROOTS=(\n'
+    local r
+    for r in "${PROJECT_ROOTS[@]}"; do printf '  %q\n' "$r"; done
+    printf ')\n'
+    if [[ ${#EXTRA_PROJECTS[@]} -gt 0 ]]; then
+      printf '\nEXTRA_PROJECTS=(\n'
+      for r in "${EXTRA_PROJECTS[@]}"; do printf '  %q\n' "$r"; done
+      printf ')\n'
+    fi
+  } > "$CONFIG_FILE"
+}
+
+save_config_if_missing() {
+  [[ -f "$CONFIG_FILE" ]] || save_config
+}
+
+# ---------------------------------------------------------------------------
+# Colours (CLI only, when stdout is a TTY)
+# ---------------------------------------------------------------------------
+
+if [[ -t 1 ]]; then
+  C_RESET=$'\e[0m'; C_BOLD=$'\e[1m'; C_DIM=$'\e[2m'
+  C_GREEN=$'\e[32m'; C_YELLOW=$'\e[33m'; C_RED=$'\e[31m'; C_BLUE=$'\e[34m'
+else
+  C_RESET= ; C_BOLD= ; C_DIM= ; C_GREEN= ; C_YELLOW= ; C_RED= ; C_BLUE=
+fi
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+have_cli() { command -v "$CLI" >/dev/null 2>&1; }
+
+run_low_priority() {
+  if command -v ionice >/dev/null 2>&1; then
+    nice -n 10 ionice -c2 -n7 "$@"
+  else
+    nice -n 10 "$@"
+  fi
+}
+
+sanitize_id() { printf '%s' "$1" | tr -cs 'A-Za-z0-9._-' '-'; }
+
+project_kind() {
+  local project="$1"
+
+  if [[ -f "$project/go.mod" || -f "$project/go.work" ]]; then
+    echo "goland"; return
+  fi
+  if [[ -f "$project/artisan" || -f "$project/composer.json" || -f "$project/composer.lock" ]]; then
+    echo "phpstorm"; return
+  fi
+  if [[ -f "$project/package.json" || -f "$project/pnpm-lock.yaml" || -f "$project/yarn.lock" \
+        || -f "$project/bun.lock" || -f "$project/bun.lockb" \
+        || -f "$project/vite.config.ts" || -f "$project/vite.config.js" ]]; then
+    echo "webstorm"; return
+  fi
+  if [[ -f "$project/.idea/dataSources.xml" ]] || find "$project" -maxdepth 2 -type f -name '*.sql' 2>/dev/null | grep -q .; then
+    echo "datagrip"; return
+  fi
+  echo "webstorm"
+}
+
+ide_for_kind() {
+  case "$1" in
+    phpstorm) printf '%s' "$PHPSTORM_HOME" ;;
+    webstorm) printf '%s' "$WEBSTORM_HOME" ;;
+    datagrip) printf '%s' "$DATAGRIP_HOME" ;;
+    goland)   printf '%s' "$GOLAND_HOME" ;;
+    *)        printf '' ;;
+  esac
+}
+
+# The fingerprint decides whether a project needs re-indexing. It MUST be
+# stable across runs for an unchanged project, which means it must contain
+# nothing the indexer itself rewrites. Concretely we DROPPED all .idea/*.xml
+# and *.iml hashing (the indexer regenerates those every run) and we exclude
+# .idea and intellij.yaml from `git status`. What remains genuinely affects
+# the produced index: the IDE version, the committed source, uncommitted
+# tracked changes, and dependency/build manifests.
+project_fingerprint() {
+  local project="$1" ide="$2"
+
+  (
+    cd "$project" 2>/dev/null || { printf 'unreadable=%s\n' "$project"; exit 0; }
+
+    printf 'project=%s\n' "$(pwd -P)"
+    printf 'ide=%s\n' "$ide"
+
+    # IDE version: Toolbox path encodes the build, and product-info.json is
+    # stable per version -> re-index on IDE upgrade, but not on every run.
+    [[ -n "$ide" && -f "$ide/product-info.json" ]] && sha256sum "$ide/product-info.json"
+
+    # Committed state + uncommitted TRACKED changes, excluding IDE/session
+    # churn so the indexer rewriting .idea / intellij.yaml never invalidates us.
+    git rev-parse HEAD 2>/dev/null || true
+    git status --porcelain=v1 -uno -- . ':(exclude).idea' ':(exclude)intellij.yaml' 2>/dev/null || true
+
+    # Dependency / build manifests that change what gets indexed.
+    local f
+    for f in \
+      composer.json composer.lock \
+      package.json package-lock.json pnpm-lock.yaml pnpm-workspace.yaml yarn.lock bun.lock bun.lockb \
+      go.mod go.sum go.work go.work.sum \
+      tsconfig.json tsconfig.app.json jsconfig.json \
+      vite.config.js vite.config.ts \
+      .nvmrc .tool-versions
+    do
+      [[ -f "$f" ]] && sha256sum "$f"
+    done
+  ) | sha256sum | awk '{print $1}'
+}
+
+extract_intellij_yaml() {
+  local log_file="$1" out_file="$2"
+  awk '
+    /^sharedIndex:/ { found=1 }
+    found && NF == 0 { exit }
+    found { print }
+  ' "$log_file" > "$out_file"
+  grep -q '^sharedIndex:' "$out_file"
+}
+
+exclude_local_intellij_yaml_from_git() {
+  local project="$1"
+  if [[ -d "$project/.git" ]]; then
+    mkdir -p "$project/.git/info"
+    touch "$project/.git/info/exclude"
+    if ! grep -qx '/intellij.yaml' "$project/.git/info/exclude"; then
+      printf '\n/intellij.yaml\n' >> "$project/.git/info/exclude"
+    fi
+  fi
+}
+
+is_project_dir() {
+  local p="$1"
+  [[ -d "$p/.idea" || -f "$p/composer.json" || -f "$p/package.json" \
+     || -f "$p/go.mod" || -f "$p/go.work" || -f "$p/artisan" ]]
+}
+
+iter_projects() {
+  {
+    local root project p
+    for root in "${PROJECT_ROOTS[@]}"; do
+      [[ -d "$root" ]] || continue
+      for project in "$root"/*; do
+        [[ -d "$project" ]] || continue
+        is_project_dir "$project" && printf '%s\n' "$project"
+      done
+    done
+    for p in "${EXTRA_PROJECTS[@]:-}"; do
+      [[ -n "$p" && -d "$p" ]] && printf '%s\n' "$p"
+    done
+  } | awk 'NF && !seen[$0]++'
+}
+
+match_only() {
+  local project="$1" csv="$2" base n
+  base="$(basename "$project")"
+  local IFS=','
+  for n in $csv; do
+    [[ -z "$n" ]] && continue
+    [[ "$base" == "$n" || "$project" == *"$n"* ]] && return 0
+  done
+  return 1
+}
+
+count_projects() { iter_projects | wc -l | tr -d ' '; }
+
+record_result() {
+  [[ -n "${IJSI_RESULTS:-}" ]] && printf '%s\t%s\n' "$1" "$2" >> "$IJSI_RESULTS"
+  return 0
+}
+
+# Returns: 3=indexed  0=up-to-date  4=skipped(no IDE)  1=failed
+index_project() {
+  local project="$1"
+  local kind ide name project_id fingerprint state_file log_file yaml_file
+
+  kind="$(project_kind "$project")"
+  ide="$(ide_for_kind "$kind")"
+  name="$(basename "$project")"
+  project_id="$(sanitize_id "${kind}-${name}")"
+  state_file="$STATE_DIR/${project_id}.sha256"
+
+  if [[ -z "$ide" ]]; then
+    printf '%sSkip%s   %s  (%s IDE not found)\n' "$C_YELLOW" "$C_RESET" "$project" "$kind"
+    record_result skipped "$project"
+    return 4
+  fi
+
+  fingerprint="$(project_fingerprint "$project" "$ide")"
+
+  if [[ -z "${IJSI_FORCE:-}" ]] && [[ -f "$state_file" ]] && [[ "$(cat "$state_file")" == "$fingerprint" ]]; then
+    printf '%sOK%s     %s  (up to date)\n' "$C_DIM" "$C_RESET" "$project"
+    record_result uptodate "$project"
+    return 0
+  fi
+
+  log_file="$LOG_DIR/${project_id}-$(date +%Y%m%d-%H%M%S).log"
+  printf '%sIndex%s  %s  [%s]\n' "$C_BLUE" "$C_RESET" "$project" "$kind"
+
+  if run_low_priority "$CLI" indexes \
+      --ij "$ide" \
+      --project "$project" \
+      --base-url "$BASE_URL" \
+      --data-directory "$DATA_DIR" \
+      > "$log_file" 2>&1
+  then
+    printf '%s\n' "$fingerprint" > "$state_file"
+
+    yaml_file="$CONFIG_DIR/${project_id}.intellij.yaml"
+    if extract_intellij_yaml "$log_file" "$yaml_file"; then
+      cp "$yaml_file" "$project/intellij.yaml"
+      exclude_local_intellij_yaml_from_git "$project"
+      printf '%sDone%s   %s  (wrote intellij.yaml)\n' "$C_GREEN" "$C_RESET" "$project"
+    else
+      printf '%sDone%s   %s  (no intellij.yaml in CLI output; see %s)\n' \
+        "$C_GREEN" "$C_RESET" "$project" "$log_file"
+    fi
+    record_result indexed "$project"
+    return 3
+  else
+    printf '%sFail%s   %s  (see %s)\n' "$C_RED" "$C_RESET" "$project" "$log_file"
+    record_result failed "$project"
+    return 1
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Locking
+# ---------------------------------------------------------------------------
+
+# Runs "$@" while holding a non-blocking refresh lock. Returns 100 if busy.
+with_refresh_lock() {
+  ensure_dirs
+  local lockfd
+  exec {lockfd}>"$CACHE_DIR/refresh.lock" || return 1
+  if ! flock -n "$lockfd"; then
+    exec {lockfd}>&-
+    return 100
+  fi
+  "$@"
+  local rc=$?
+  flock -u "$lockfd"
+  exec {lockfd}>&-
+  return $rc
+}
+
+# ---------------------------------------------------------------------------
+# CLI commands
+# ---------------------------------------------------------------------------
+
+do_refresh_cli() {
+  local force="$1" only="$2"
+  local n_idx=0 n_up=0 n_skip=0 n_fail=0 total=0
+  local project
+  local IJSI_FORCE="$force"   # visible to index_project via bash dynamic scope
+
+  while IFS= read -r project; do
+    [[ -z "$project" ]] && continue
+    if [[ -n "$only" ]] && ! match_only "$project" "$only"; then continue; fi
+    total=$((total + 1))
+    index_project "$project"
+    case $? in
+      3) n_idx=$((n_idx + 1)) ;;
+      0) n_up=$((n_up + 1)) ;;
+      4) n_skip=$((n_skip + 1)) ;;
+      *) n_fail=$((n_fail + 1)) ;;
+    esac
+  done < <(iter_projects)
+
+  printf '\n%sSummary%s  indexed=%d  up-to-date=%d  skipped=%d  failed=%d  (of %d)\n' \
+    "$C_BOLD" "$C_RESET" "$n_idx" "$n_up" "$n_skip" "$n_fail" "$total"
+  [[ $n_fail -gt 0 ]] && return 1 || return 0
+}
+
+cmd_refresh() {
+  local force="" only=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -f|--force)   force="1" ;;
+      --only)       shift; only="${1:-}" ;;
+      --only=*)     only="${1#*=}" ;;
+      -h|--help)    echo "usage: ijsi refresh [--force] [--only name,name,...]"; return 0 ;;
+      *)            echo "refresh: unknown argument: $1" >&2; return 1 ;;
+    esac
+    shift
+  done
+
+  if ! have_cli; then
+    echo "Missing CLI: $CLI" >&2
+    echo "Install ij-shared-indexes-tool-cli and ensure it is on PATH (or set IJSI_CLI)." >&2
+    return 1
+  fi
+
+  with_refresh_lock do_refresh_cli "$force" "$only"
+  local rc=$?
+  if [[ $rc -eq 100 ]]; then
+    echo "Another ijsi refresh is already running. Skipping." >&2
+    return 0
+  fi
+  return $rc
+}
+
+cmd_server() {
+  ensure_dirs
+  exec "$CLI" server --port "$PORT" --server-directory "$DATA_DIR/server"
+}
+
+cmd_check() {
+  printf '%sijsi%s %s\n\n' "$C_BOLD" "$C_RESET" "$IJSI_VERSION"
+
+  printf 'Config file:\n  %s%s\n\n' "$CONFIG_FILE" \
+    "$([[ -f "$CONFIG_FILE" ]] && echo "" || echo "  (not created yet)")"
+
+  printf 'CLI:\n  %s\n\n' "$(have_cli && command -v "$CLI" || echo "not found: $CLI")"
+
+  printf 'Terminal GUI:\n  %s\n\n' "$(detect_tui_name)"
+
+  printf 'Detected IDE homes:\n'
+  printf '  PhpStorm: %s\n' "${PHPSTORM_HOME:-not found}"
+  printf '  WebStorm: %s\n' "${WEBSTORM_HOME:-not found}"
+  printf '  DataGrip: %s\n' "${DATAGRIP_HOME:-not found}"
+  printf '  GoLand:   %s\n\n' "${GOLAND_HOME:-not found}"
+
+  printf 'Project roots:\n'
+  local root
+  for root in "${PROJECT_ROOTS[@]}"; do
+    if [[ -d "$root" ]]; then printf '  found:   %s\n' "$root"; else printf '  missing: %s\n' "$root"; fi
+  done
+  printf '  projects discovered: %s\n\n' "$(count_projects)"
+
+  printf 'Server URL:   %s\n' "$BASE_URL"
+  printf 'Cache:        %s\n' "$CACHE_DIR"
+  printf 'Refresh int.: %s\n\n' "$REFRESH_INTERVAL"
+
+  printf 'Systemd:\n'
+  printf '  server: %s\n' "$(server_state)"
+  printf '  timer:  %s\n' "$(timer_state)"
+}
+
+cmd_list() {
+  iter_projects | while read -r project; do
+    local kind ide
+    kind="$(project_kind "$project")"
+    ide="$(ide_for_kind "$kind")"
+    printf '%-9s %-70s %s\n' "$kind" "$project" "${ide:-IDE not found}"
+  done
+}
+
+cmd_reset_state() {
+  rm -f "$STATE_DIR"/*.sha256 2>/dev/null
+  echo "State reset. Next refresh will recheck all projects."
+}
+
+cmd_clear_cache() {
+  rm -rf "$CACHE_DIR"
+  ensure_dirs
+  echo "Cache cleared: $CACHE_DIR"
+}
+
+cmd_prune_logs() {
+  local keep="${1:-100}" removed
+  removed="$(ls -1t "$LOG_DIR"/*.log 2>/dev/null | tail -n +"$((keep + 1))" | wc -l | tr -d ' ')"
+  ls -1t "$LOG_DIR"/*.log 2>/dev/null | tail -n +"$((keep + 1))" | xargs -r rm -f
+  echo "Pruned ${removed:-0} old log file(s); kept newest $keep."
+}
+
+cmd_config() {
+  case "${1:-show}" in
+    show|"")  print_resolved_config ;;
+    path)     printf '%s\n' "$CONFIG_FILE" ;;
+    init)     save_config; echo "Wrote $CONFIG_FILE" ;;
+    edit)     save_config_if_missing; "${EDITOR:-vi}" "$CONFIG_FILE" ;;
+    *)        echo "config: unknown subcommand: $1" >&2
+              echo "usage: ijsi config [show|path|init|edit]" >&2; return 1 ;;
+  esac
+}
+
+print_resolved_config() {
+  printf 'config file:       %s\n' "$CONFIG_FILE"
+  printf 'PORT:              %s\n' "$PORT"
+  printf 'BASE_URL:          %s\n' "$BASE_URL"
+  printf 'CACHE_DIR:         %s\n' "$CACHE_DIR"
+  printf 'CLI:               %s\n' "$CLI"
+  printf 'TOOLBOX_APPS:      %s\n' "$TOOLBOX_APPS"
+  printf 'REFRESH_INTERVAL:  %s\n' "$REFRESH_INTERVAL"
+  printf 'PHPSTORM_IDE:      %s  ->  %s\n' "$PHPSTORM_IDE" "${PHPSTORM_HOME:-<none>}"
+  printf 'WEBSTORM_IDE:      %s  ->  %s\n' "$WEBSTORM_IDE" "${WEBSTORM_HOME:-<none>}"
+  printf 'DATAGRIP_IDE:      %s  ->  %s\n' "$DATAGRIP_IDE" "${DATAGRIP_HOME:-<none>}"
+  printf 'GOLAND_IDE:        %s  ->  %s\n' "$GOLAND_IDE" "${GOLAND_HOME:-<none>}"
+  printf 'PROJECT_ROOTS:     %s\n' "${PROJECT_ROOTS[*]}"
+}
+
+# ---------------------------------------------------------------------------
+# systemd (user) services
+# ---------------------------------------------------------------------------
+
+server_state() { local s; s="$(systemctl --user is-active ij-shared-indexes-server.service 2>/dev/null)"; printf '%s' "${s:-unknown}"; }
+timer_state()  { local s; s="$(systemctl --user is-active ij-shared-indexes-refresh.timer 2>/dev/null)"; printf '%s' "${s:-unknown}"; }
+
+cmd_install_systemd() {
+  mkdir -p "$SYSTEMD_DIR"
+
+  cat > "$SYSTEMD_DIR/ij-shared-indexes-server.service" <<EOF
+[Unit]
+Description=JetBrains Shared Indexes Local Server
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=$SELF server
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+EOF
+
+  cat > "$SYSTEMD_DIR/ij-shared-indexes-refresh.service" <<EOF
+[Unit]
+Description=Refresh JetBrains Shared Indexes
+
+[Service]
+Type=oneshot
+ExecStart=$SELF refresh
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+EOF
+
+  cat > "$SYSTEMD_DIR/ij-shared-indexes-refresh.timer" <<EOF
+[Unit]
+Description=Periodically refresh JetBrains Shared Indexes
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=$REFRESH_INTERVAL
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl --user daemon-reload
+  systemctl --user enable --now ij-shared-indexes-server.service
+  systemctl --user enable --now ij-shared-indexes-refresh.timer
+  echo "Installed and enabled systemd user services (interval: $REFRESH_INTERVAL)."
+}
+
+cmd_uninstall_systemd() {
+  systemctl --user disable --now ij-shared-indexes-refresh.timer 2>/dev/null || true
+  systemctl --user disable --now ij-shared-indexes-server.service 2>/dev/null || true
+  rm -f "$SYSTEMD_DIR/ij-shared-indexes-server.service" \
+        "$SYSTEMD_DIR/ij-shared-indexes-refresh.service" \
+        "$SYSTEMD_DIR/ij-shared-indexes-refresh.timer"
+  systemctl --user daemon-reload
+  echo "Removed systemd user services."
+}
+
+cmd_status() {
+  systemctl --user status ij-shared-indexes-server.service --no-pager 2>&1
+  echo
+  systemctl --user status ij-shared-indexes-refresh.timer --no-pager 2>&1
+}
+
+cmd_logs()        { journalctl --user -u ij-shared-indexes-refresh.service -f; }
+cmd_server_logs() { journalctl --user -u ij-shared-indexes-server.service -f; }
+
+# ===========================================================================
+# Terminal GUI (whiptail / dialog)
+# ===========================================================================
+
+TUI=""
+detect_tui() {
+  if   command -v whiptail >/dev/null 2>&1; then TUI=whiptail
+  elif command -v dialog   >/dev/null 2>&1; then TUI=dialog
+  else TUI=""; fi
+}
+detect_tui_name() {
+  detect_tui
+  [[ -n "$TUI" ]] && command -v "$TUI" || echo "none (install 'whiptail' or 'dialog')"
+}
+
+# whiptail/dialog wrappers. Both write the chosen value to stderr; the
+# 3>&1 1>&2 2>&3 dance moves it to stdout so we can capture it.
+tui_menu()      { local t="$1" x="$2"; shift 2; "$TUI" --title "$t" --menu      "$x" 21 78 12 "$@" 3>&1 1>&2 2>&3; }
+tui_checklist() { local t="$1" x="$2"; shift 2; "$TUI" --title "$t" --checklist "$x" 22 90 14 "$@" 3>&1 1>&2 2>&3; }
+tui_input()     { local t="$1" x="$2" d="$3";   "$TUI" --title "$t" --inputbox  "$x" 10 78 "$d" 3>&1 1>&2 2>&3; }
+tui_yesno()     { local t="$1" x="$2";          "$TUI" --title "$t" --yesno     "$x" 12 78; }
+tui_msg()       { local t="$1" x="$2";          "$TUI" --title "$t" --msgbox    "$x" 18 80; }
+tui_textbox()   { local t="$1" f="$2";          "$TUI" --title "$t" --textbox   "$f" 26 100; }
+tui_gauge()     { local t="$1";                 "$TUI" --title "$t" --gauge "Starting..." 8 74 0; }
+
+tui_main() {
+  detect_tui
+  if [[ -z "$TUI" ]]; then
+    echo "The terminal GUI needs 'whiptail' (package: newt) or 'dialog'." >&2
+    echo "Install one, e.g.:  sudo apt install whiptail   (or: sudo dnf install newt)" >&2
+    echo >&2
+    usage
+    return 1
+  fi
+
+  ensure_dirs
+  save_config_if_missing
+
+  local choice header
+  while true; do
+    header="$(printf 'Local JetBrains shared-index manager (v%s)\n\nServer: %s    Timer: %s\nProjects: %s    Config: %s\n\nChoose an action:' \
+      "$IJSI_VERSION" "$(server_state)" "$(timer_state)" "$(count_projects)" "$CONFIG_FILE")"
+
+    choice="$(tui_menu "ijsi" "$header" \
+      refresh "Refresh / index all projects" \
+      select  "Pick specific projects to index" \
+      force   "Force re-index everything (ignore cache)" \
+      config  "Configure settings" \
+      server  "Server & systemd services" \
+      status  "Status & health check" \
+      logs    "View / follow logs" \
+      maint   "Maintenance (reset state, clear cache)" \
+      quit    "Quit")" || break
+
+    case "$choice" in
+      refresh) tui_run_refresh "" "$(iter_projects)" ;;
+      select)  tui_select_refresh ;;
+      force)   tui_yesno "Force re-index" "Re-index ALL projects, ignoring the cache?\nThis can take a while." \
+                 && tui_run_refresh "1" "$(iter_projects)" ;;
+      config)  tui_config_menu ;;
+      server)  tui_server_menu ;;
+      status)  tui_show_status ;;
+      logs)    tui_logs_menu ;;
+      maint)   tui_maint_menu ;;
+      quit|"") break ;;
+    esac
+  done
+  clear 2>/dev/null || true
+}
+
+# Drives index_project across a newline-separated project list, showing a gauge.
+tui_run_refresh() {
+  local force="$1" project_list="$2"
+  local -a projects=()
+  local p
+  while IFS= read -r p; do [[ -n "$p" ]] && projects+=( "$p" ); done <<< "$project_list"
+
+  local total=${#projects[@]}
+  if [[ $total -eq 0 ]]; then tui_msg "Refresh" "No projects to index."; return; fi
+
+  if ! have_cli; then
+    tui_msg "Refresh" "Missing CLI: $CLI\n\nInstall ij-shared-indexes-tool-cli and ensure it is on PATH, or set IJSI_CLI in the config."
+    return
+  fi
+
+  ensure_dirs
+  local lockfd
+  exec {lockfd}>"$CACHE_DIR/refresh.lock" || { tui_msg "Refresh" "Cannot open lock file."; return; }
+  if ! flock -n "$lockfd"; then
+    exec {lockfd}>&-
+    tui_msg "Refresh" "Another refresh is already running (systemd timer or another window)."
+    return
+  fi
+
+  local results runlog
+  results="$(mktemp)"
+  runlog="$LOG_DIR/refresh-$(date +%Y%m%d-%H%M%S).log"
+
+  {
+    local i=0 name pct
+    local IJSI_RESULTS="$results"
+    local IJSI_FORCE="$force"
+    for p in "${projects[@]}"; do
+      name="$(basename "$p")"
+      pct=$(( i * 100 / total ))
+      printf 'XXX\n%d\nIndexing %s   (%d of %d)\nXXX\n' "$pct" "$name" "$((i + 1))" "$total"
+      index_project "$p" >> "$runlog" 2>&1
+      i=$((i + 1))
+    done
+    printf 'XXX\n100\nFinished.\nXXX\n'
+  } | tui_gauge "Refreshing shared indexes"
+
+  flock -u "$lockfd"
+  exec {lockfd}>&-
+
+  local n_idx n_up n_skip n_fail
+  n_idx=$(grep -c '^indexed'  "$results" 2>/dev/null);  n_idx=${n_idx:-0}
+  n_up=$(grep  -c '^uptodate' "$results" 2>/dev/null);  n_up=${n_up:-0}
+  n_skip=$(grep -c '^skipped' "$results" 2>/dev/null);  n_skip=${n_skip:-0}
+  n_fail=$(grep -c '^failed'  "$results" 2>/dev/null);  n_fail=${n_fail:-0}
+  rm -f "$results"
+
+  local summary
+  summary="$(printf 'Indexed:     %s\nUp to date:  %s\nSkipped:     %s\nFailed:      %s\n\nLog: %s' \
+    "$n_idx" "$n_up" "$n_skip" "$n_fail" "$runlog")"
+  tui_msg "Refresh complete" "$summary"
+
+  if [[ "$n_fail" -gt 0 ]] && tui_yesno "Refresh" "Some projects failed. View the log now?"; then
+    tui_textbox "Refresh log" "$runlog"
+  fi
+}
+
+tui_select_refresh() {
+  local -a plist=() items=() selected=()
+  local p k
+  while IFS= read -r p; do [[ -n "$p" ]] && plist+=( "$p" ); done < <(iter_projects)
+
+  if [[ ${#plist[@]} -eq 0 ]]; then tui_msg "Select projects" "No projects found."; return; fi
+
+  for p in "${plist[@]}"; do
+    k="$(project_kind "$p")"
+    items+=( "$p" "[$k] $(basename "$p")" "off" )
+  done
+
+  local chosen
+  chosen="$(tui_checklist "Select projects" "Space toggles, Enter confirms. Selected projects will be indexed." "${items[@]}")" || return
+  [[ -z "$chosen" ]] && { tui_msg "Select projects" "Nothing selected."; return; }
+
+  eval "selected=( $chosen )"
+  local joined
+  printf -v joined '%s\n' "${selected[@]}"
+  tui_run_refresh "" "$joined"
+}
+
+tui_config_menu() {
+  local choice
+  while true; do
+    choice="$(tui_menu "Configure" "Settings are saved to:\n$CONFIG_FILE\n\n(IJSI_* environment variables override the file.)" \
+      port     "Server port                ($PORT)" \
+      interval "Refresh interval           ($REFRESH_INTERVAL)" \
+      roots    "Project root folders       (${#PROJECT_ROOTS[@]})" \
+      ides     "IDE install locations" \
+      toolbox  "Toolbox apps folder" \
+      cli      "shared-indexes CLI         ($CLI)" \
+      view     "View resolved configuration" \
+      edit     "Open config file in \$EDITOR" \
+      back     "Back")" || return
+
+    case "$choice" in
+      port)     local v; v="$(tui_input "Server port" "TCP port for the local shared-index server:" "$PORT")" \
+                  && [[ "$v" =~ ^[0-9]+$ ]] && { PORT="$v"; BASE_URL="http://127.0.0.1:${PORT}"; save_config; } ;;
+      interval) local v; v="$(tui_input "Refresh interval" "systemd timer interval (e.g. 30min, 2h, 1d):" "$REFRESH_INTERVAL")" \
+                  && [[ -n "$v" ]] && { REFRESH_INTERVAL="$v"; save_config; } ;;
+      roots)    tui_roots_menu ;;
+      ides)     tui_ides_menu ;;
+      toolbox)  local v; v="$(tui_input "Toolbox apps" "Folder containing JetBrains Toolbox app installs:" "$TOOLBOX_APPS")" \
+                  && [[ -n "$v" ]] && { TOOLBOX_APPS="$v"; apply_env_and_defaults; save_config; } ;;
+      cli)      local v; v="$(tui_input "CLI" "shared-indexes CLI command or path:" "$CLI")" \
+                  && [[ -n "$v" ]] && { CLI="$v"; save_config; } ;;
+      view)     local t; t="$(mktemp)"; print_resolved_config > "$t"; tui_textbox "Resolved configuration" "$t"; rm -f "$t" ;;
+      edit)     save_config; clear 2>/dev/null || true; "${EDITOR:-vi}" "$CONFIG_FILE"; load_config; apply_env_and_defaults ;;
+      back|"")  return ;;
+    esac
+  done
+}
+
+tui_roots_menu() {
+  local choice
+  while true; do
+    local -a items=()
+    local r idx=0
+    for r in "${PROJECT_ROOTS[@]}"; do items+=( "$idx" "$r" ); idx=$((idx + 1)); done
+    items+=( "add" "+ Add a project root..." )
+    items+=( "back" "Back" )
+
+    choice="$(tui_menu "Project roots" "Select a root to remove, or add a new one:" "${items[@]}")" || return
+    case "$choice" in
+      add)  local v; v="$(tui_input "Add project root" "Path to a folder containing project directories:" "$HOME/")" \
+              && [[ -n "$v" ]] && { PROJECT_ROOTS+=( "$v" ); save_config; } ;;
+      back|"") return ;;
+      *)    if tui_yesno "Remove root" "Remove this project root?\n\n${PROJECT_ROOTS[$choice]}"; then
+              unset 'PROJECT_ROOTS[$choice]'
+              PROJECT_ROOTS=( "${PROJECT_ROOTS[@]}" )
+              save_config
+            fi ;;
+    esac
+  done
+}
+
+tui_ides_menu() {
+  local choice
+  while true; do
+    choice="$(tui_menu "IDE locations" "Set each IDE to 'auto' (detect from Toolbox) or an absolute install dir." \
+      phpstorm "PhpStorm   ($PHPSTORM_IDE)" \
+      webstorm "WebStorm   ($WEBSTORM_IDE)" \
+      datagrip "DataGrip   ($DATAGRIP_IDE)" \
+      goland   "GoLand     ($GOLAND_IDE)" \
+      back     "Back")" || return
+
+    local var cur
+    case "$choice" in
+      phpstorm) var=PHPSTORM_IDE; cur="$PHPSTORM_IDE" ;;
+      webstorm) var=WEBSTORM_IDE; cur="$WEBSTORM_IDE" ;;
+      datagrip) var=DATAGRIP_IDE; cur="$DATAGRIP_IDE" ;;
+      goland)   var=GOLAND_IDE;   cur="$GOLAND_IDE" ;;
+      back|"")  return ;;
+    esac
+
+    local v
+    v="$(tui_input "$choice" "'auto' to detect, or an absolute IDE install dir:" "$cur")" || continue
+    [[ -z "$v" ]] && continue
+    printf -v "$var" '%s' "$v"
+    apply_env_and_defaults
+    save_config
+  done
+}
+
+tui_server_menu() {
+  local choice
+  while true; do
+    choice="$(tui_menu "Server & systemd" "Server: $(server_state)    Timer: $(timer_state)    Interval: $REFRESH_INTERVAL" \
+      install   "Install + enable services (server + timer)" \
+      uninstall "Uninstall services" \
+      restart   "Restart server service" \
+      runnow    "Run a refresh now (in background)" \
+      interval  "Change refresh interval & reinstall" \
+      back      "Back")" || return
+
+    case "$choice" in
+      install)   local t; t="$(mktemp)"; cmd_install_systemd > "$t" 2>&1; tui_textbox "Install" "$t"; rm -f "$t" ;;
+      uninstall) tui_yesno "Uninstall" "Remove the systemd user services?" \
+                   && { local t; t="$(mktemp)"; cmd_uninstall_systemd > "$t" 2>&1; tui_textbox "Uninstall" "$t"; rm -f "$t"; } ;;
+      restart)   systemctl --user restart ij-shared-indexes-server.service 2>/dev/null; tui_msg "Server" "Restart requested.\nState: $(server_state)" ;;
+      runnow)    systemctl --user start ij-shared-indexes-refresh.service 2>/dev/null \
+                   && tui_msg "Refresh" "Started a background refresh via systemd.\nWatch it under Logs." \
+                   || tui_msg "Refresh" "Could not start the service. Is it installed?" ;;
+      interval)  local v; v="$(tui_input "Refresh interval" "New interval (e.g. 30min, 2h, 1d):" "$REFRESH_INTERVAL")" \
+                   && [[ -n "$v" ]] && { REFRESH_INTERVAL="$v"; save_config; local t; t="$(mktemp)"; cmd_install_systemd > "$t" 2>&1; tui_textbox "Reinstalled" "$t"; rm -f "$t"; } ;;
+      back|"")   return ;;
+    esac
+  done
+}
+
+tui_show_status() {
+  local t; t="$(mktemp)"
+  { cmd_check; echo; echo "----- systemd -----"; cmd_status; } > "$t" 2>&1
+  tui_textbox "Status & health" "$t"
+  rm -f "$t"
+}
+
+tui_logs_menu() {
+  local choice
+  while true; do
+    local -a items=()
+    local f n=0
+    while IFS= read -r f; do
+      [[ -z "$f" ]] && continue
+      items+=( "$f" "$(basename "$f")" )
+      n=$((n + 1))
+    done < <(ls -1t "$LOG_DIR"/*.log 2>/dev/null | head -n 25)
+
+    if [[ $n -eq 0 ]]; then tui_msg "Logs" "No logs yet. Run a refresh first."; return; fi
+    items+=( "back" "Back" )
+
+    choice="$(tui_menu "Logs" "Most recent log files in:\n$LOG_DIR" "${items[@]}")" || return
+    [[ "$choice" == "back" || -z "$choice" ]] && return
+    tui_textbox "$(basename "$choice")" "$choice"
+  done
+}
+
+tui_maint_menu() {
+  local choice
+  while true; do
+    choice="$(tui_menu "Maintenance" "Cache: $CACHE_DIR" \
+      reset  "Reset fingerprints (force recheck next refresh)" \
+      prune  "Prune old log files (keep newest 100)" \
+      clear  "Clear ENTIRE shared-index cache" \
+      back   "Back")" || return
+
+    case "$choice" in
+      reset)  tui_yesno "Reset state" "Forget all fingerprints?\nThe next refresh will recheck every project." \
+                && { cmd_reset_state >/dev/null; tui_msg "Reset state" "Done. Next refresh rechecks all projects."; } ;;
+      prune)  local t; t="$(mktemp)"; cmd_prune_logs 100 > "$t" 2>&1; tui_textbox "Prune logs" "$t"; rm -f "$t" ;;
+      clear)  tui_yesno "Clear cache" "Delete the entire generated shared-index cache?\n\n$CACHE_DIR" \
+                && { cmd_clear_cache >/dev/null; tui_msg "Clear cache" "Cache cleared."; } ;;
+      back|"") return ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Usage / dispatch
+# ---------------------------------------------------------------------------
+
+usage() {
+  cat <<EOF
+ijsi $IJSI_VERSION - JetBrains shared indexes local manager
+
+Run with no arguments to open the terminal GUI.
+
+Commands:
+  (no args)         Open the terminal GUI (whiptail/dialog)
+  tui               Open the terminal GUI explicitly
+  refresh [opts]    Generate/update indexes for new or changed projects
+                      --force            re-index even if unchanged
+                      --only a,b,c       only projects whose name/path matches
+  list              List detected projects and their IDE
+  check | doctor    Show detected IDEs, CLI, roots, server/timer status
+  server            Start the local shared-index HTTP server (foreground)
+  status            Show systemd user service/timer status
+  logs              Follow refresh logs (journalctl)
+  server-logs       Follow server logs (journalctl)
+  install-systemd   Install and enable user systemd service + timer
+  uninstall-systemd Remove user systemd service + timer
+  config [sub]      show | path | init | edit   (manage $CONFIG_FILE)
+  reset-state       Forget fingerprints so next refresh rechecks all projects
+  clear-cache       Delete the generated shared-index cache
+  prune-logs [N]    Keep newest N logs (default 100), delete the rest
+  version           Print version
+  help              Show this help
+
+Configuration precedence:  built-in defaults  <  $CONFIG_FILE  <  IJSI_* env
+EOF
+}
+
+main() {
+  load_config
+  apply_env_and_defaults
+
+  case "${1:-}" in
+    ""|tui|menu|ui)     shift 2>/dev/null || true; tui_main ;;
+    refresh)            shift; cmd_refresh "$@" ;;
+    list)               cmd_list ;;
+    check|doctor)       cmd_check ;;
+    server)             cmd_server ;;
+    status)             cmd_status ;;
+    logs)               cmd_logs ;;
+    server-logs)        cmd_server_logs ;;
+    install-systemd)    cmd_install_systemd ;;
+    uninstall-systemd)  cmd_uninstall_systemd ;;
+    config)             shift; cmd_config "$@" ;;
+    reset-state)        cmd_reset_state ;;
+    clear-cache)        cmd_clear_cache ;;
+    prune-logs)         shift; cmd_prune_logs "$@" ;;
+    version|-V|--version) echo "ijsi $IJSI_VERSION" ;;
+    -h|--help|help)     usage ;;
+    *)
+      echo "Unknown command: $1" >&2
+      echo >&2
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+# Only run when executed directly (allows sourcing for tests/reuse).
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi
