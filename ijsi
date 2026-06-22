@@ -249,14 +249,38 @@ extract_intellij_yaml() {
   grep -q '^sharedIndex:' "$out_file"
 }
 
-exclude_local_intellij_yaml_from_git() {
+is_loopback_url() {
+  # True when the URL host is localhost/loopback -> intellij.yaml is machine-local.
+  case "$1" in
+    *://127.0.0.1*|*://localhost*|*://[::1]*|*://0.0.0.0*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Per the JetBrains doc, intellij.yaml should be committed to VCS so the team
+# inherits the shared-index config -- but ONLY when the server URL is reachable
+# by the team. A loopback URL (127.0.0.1/localhost) resolves to each developer's
+# OWN machine, so committing it would break everyone else and is wrong for the
+# localhost workflow. So: for a loopback base-url we git-exclude the file; for a
+# real shared/remote base-url we leave it tracked and tell you to commit it.
+handle_intellij_yaml_vcs() {
   local project="$1"
-  if [[ -d "$project/.git" ]]; then
-    mkdir -p "$project/.git/info"
-    touch "$project/.git/info/exclude"
+  [[ -d "$project/.git" ]] || return 0
+  mkdir -p "$project/.git/info"
+  touch "$project/.git/info/exclude"
+
+  if is_loopback_url "$BASE_URL"; then
     if ! grep -qx '/intellij.yaml' "$project/.git/info/exclude"; then
       printf '\n/intellij.yaml\n' >> "$project/.git/info/exclude"
     fi
+    printf '       localhost URL -> kept out of VCS (.git/info/exclude)\n'
+  else
+    # Shared/remote server: ensure we are NOT excluding it, so it can be committed.
+    if grep -qx '/intellij.yaml' "$project/.git/info/exclude"; then
+      grep -vx '/intellij.yaml' "$project/.git/info/exclude" > "$project/.git/info/exclude.ijsi.tmp" \
+        && mv "$project/.git/info/exclude.ijsi.tmp" "$project/.git/info/exclude"
+    fi
+    printf '       shared URL -> commit %s/intellij.yaml so your team gets the indexes\n' "$project"
   fi
 }
 
@@ -295,6 +319,19 @@ match_only() {
 
 count_projects() { iter_projects | wc -l | tr -d ' '; }
 
+# Resolve a CLI argument (a project basename, a path fragment, or an absolute
+# path) to a single discovered project directory.
+resolve_project_arg() {
+  local arg="$1" p
+  if [[ -d "$arg" ]] && is_project_dir "$arg"; then
+    printf '%s' "$(readlink -f "$arg")"; return 0
+  fi
+  while IFS= read -r p; do
+    [[ "$(basename "$p")" == "$arg" || "$p" == *"$arg"* ]] && { printf '%s' "$p"; return 0; }
+  done < <(iter_projects)
+  return 1
+}
+
 record_result() {
   [[ -n "${IJSI_RESULTS:-}" ]] && printf '%s\t%s\n' "$1" "$2" >> "$IJSI_RESULTS"
   return 0
@@ -313,6 +350,13 @@ index_project() {
 
   if [[ -z "$ide" ]]; then
     printf '%sSkip%s   %s  (%s IDE not found)\n' "$C_YELLOW" "$C_RESET" "$project" "$kind"
+    record_result skipped "$project"
+    return 4
+  fi
+
+  if [[ ! -e "$ide/product-info.json" ]]; then
+    printf '%sSkip%s   %s  (%s IDE looks incomplete: no product-info.json at %s)\n' \
+      "$C_YELLOW" "$C_RESET" "$project" "$kind" "$ide"
     record_result skipped "$project"
     return 4
   fi
@@ -340,8 +384,8 @@ index_project() {
     yaml_file="$CONFIG_DIR/${project_id}.intellij.yaml"
     if extract_intellij_yaml "$log_file" "$yaml_file"; then
       cp "$yaml_file" "$project/intellij.yaml"
-      exclude_local_intellij_yaml_from_git "$project"
       printf '%sDone%s   %s  (wrote intellij.yaml)\n' "$C_GREEN" "$C_RESET" "$project"
+      handle_intellij_yaml_vcs "$project"
     else
       printf '%sDone%s   %s  (no intellij.yaml in CLI output; see %s)\n' \
         "$C_GREEN" "$C_RESET" "$project" "$log_file"
@@ -436,6 +480,53 @@ cmd_server() {
   exec "$CLI" server --port "$PORT" --server-directory "$DATA_DIR/server"
 }
 
+# Doc "boost": measure project-analysis time with vs. without shared indexes,
+# so you can decide whether shared indexes are worth it for a given project.
+cmd_boost() {
+  local target="${1:-}"
+  if [[ -z "$target" ]]; then
+    echo "usage: ijsi boost <project-name-or-path>" >&2
+    echo "Measures project-analysis time with vs. without shared indexes." >&2
+    return 1
+  fi
+  if ! have_cli; then echo "Missing CLI: $CLI" >&2; return 1; fi
+
+  local project kind ide
+  project="$(resolve_project_arg "$target")" || { echo "No matching project for: $target" >&2; return 1; }
+  kind="$(project_kind "$project")"
+  ide="$(ide_for_kind "$kind")"
+  if [[ -z "$ide" || ! -e "$ide/product-info.json" ]]; then
+    echo "No usable $kind IDE found for $project (set the IDE path in: ijsi config)." >&2
+    return 1
+  fi
+
+  ensure_dirs
+  echo "Boost: measuring shared-index speedup for $project  [$kind]"
+  echo "This analyzes the project with and without shared indexes; it can take a while..."
+  run_low_priority "$CLI" boost \
+    --ij "$ide" \
+    --project "$project" \
+    --port "$PORT" \
+    --data-directory "$DATA_DIR"
+}
+
+# Doc "version": the CLI reports the shared-index version for an IDE (--ij).
+cmd_version() {
+  echo "ijsi $IJSI_VERSION"
+  if ! have_cli; then
+    echo "(ij-shared-indexes-tool-cli not found: $CLI)"
+    return 0
+  fi
+  local ide="${PHPSTORM_HOME:-${WEBSTORM_HOME:-${GOLAND_HOME:-${DATAGRIP_HOME:-}}}}"
+  if [[ -n "$ide" && -e "$ide/product-info.json" ]]; then
+    echo
+    echo "ij-shared-indexes-tool-cli version (--ij $ide):"
+    "$CLI" version --ij "$ide" 2>&1 | sed 's/^/  /'
+  else
+    echo "(point ijsi at an installed IDE to query the CLI shared-index version)"
+  fi
+}
+
 cmd_check() {
   printf '%sijsi%s %s\n\n' "$C_BOLD" "$C_RESET" "$IJSI_VERSION"
 
@@ -478,8 +569,20 @@ cmd_list() {
 }
 
 cmd_reset_state() {
-  rm -f "$STATE_DIR"/*.sha256 2>/dev/null
-  echo "State reset. Next refresh will recheck all projects."
+  local target="${1:-}"
+  if [[ -z "$target" ]]; then
+    rm -f "$STATE_DIR"/*.sha256 2>/dev/null
+    echo "State reset. Next refresh will recheck all projects."
+    return 0
+  fi
+
+  local project kind name project_id
+  project="$(resolve_project_arg "$target")" || { echo "No matching project for: $target" >&2; return 1; }
+  kind="$(project_kind "$project")"
+  name="$(basename "$project")"
+  project_id="$(sanitize_id "${kind}-${name}")"
+  rm -f "$STATE_DIR/${project_id}.sha256"
+  echo "State reset for: $project  (next refresh will re-index it)."
 }
 
 cmd_clear_cache() {
@@ -643,6 +746,7 @@ tui_main() {
       refresh "Refresh / index all projects" \
       select  "Pick specific projects to index" \
       force   "Force re-index everything (ignore cache)" \
+      boost   "Evaluate speedup on one project (boost)" \
       config  "Configure settings" \
       server  "Server & systemd services" \
       status  "Status & health check" \
@@ -655,6 +759,7 @@ tui_main() {
       select)  tui_select_refresh ;;
       force)   tui_yesno "Force re-index" "Re-index ALL projects, ignoring the cache?\nThis can take a while." \
                  && tui_run_refresh "1" "$(iter_projects)" ;;
+      boost)   tui_boost ;;
       config)  tui_config_menu ;;
       server)  tui_server_menu ;;
       status)  tui_show_status ;;
@@ -748,6 +853,24 @@ tui_select_refresh() {
   local joined
   printf -v joined '%s\n' "${selected[@]}"
   tui_run_refresh "" "$joined"
+}
+
+tui_boost() {
+  local -a plist=() items=()
+  local p k proj
+  while IFS= read -r p; do [[ -n "$p" ]] && plist+=( "$p" ); done < <(iter_projects)
+  if [[ ${#plist[@]} -eq 0 ]]; then tui_msg "Boost" "No projects found."; return; fi
+  for p in "${plist[@]}"; do k="$(project_kind "$p")"; items+=( "$p" "[$k] $(basename "$p")" ); done
+
+  proj="$(tui_menu "Boost - evaluate speedup" "Pick a project to measure the shared-index speedup (with vs. without):" "${items[@]}")" || return
+  [[ -z "$proj" ]] && return
+
+  clear 2>/dev/null || true
+  local out; out="$(mktemp)"
+  cmd_boost "$proj" 2>&1 | tee "$out"
+  echo; echo "Press Enter to return to the menu..."; read -r _ || true
+  tui_textbox "Boost result" "$out"
+  rm -f "$out"
 }
 
 tui_config_menu() {
@@ -922,6 +1045,7 @@ Commands:
   refresh [opts]    Generate/update indexes for new or changed projects
                       --force            re-index even if unchanged
                       --only a,b,c       only projects whose name/path matches
+  boost <project>   Measure analysis-time speedup with vs. without indexes
   list              List detected projects and their IDE
   check | doctor    Show detected IDEs, CLI, roots, server/timer status
   server            Start the local shared-index HTTP server (foreground)
@@ -931,10 +1055,10 @@ Commands:
   install-systemd   Install and enable user systemd service + timer
   uninstall-systemd Remove user systemd service + timer
   config [sub]      show | path | init | edit   (manage $CONFIG_FILE)
-  reset-state       Forget fingerprints so next refresh rechecks all projects
+  reset-state [p]   Forget fingerprints (all, or one project) so they re-index
   clear-cache       Delete the generated shared-index cache
   prune-logs [N]    Keep newest N logs (default 100), delete the rest
-  version           Print version
+  version           Print ijsi + ij-shared-indexes-tool-cli version
   help              Show this help
 
 Configuration precedence:  built-in defaults  <  $CONFIG_FILE  <  IJSI_* env
@@ -948,6 +1072,7 @@ main() {
   case "${1:-}" in
     ""|tui|menu|ui)     shift 2>/dev/null || true; tui_main ;;
     refresh)            shift; cmd_refresh "$@" ;;
+    boost|evaluate)     shift; cmd_boost "$@" ;;
     list)               cmd_list ;;
     check|doctor)       cmd_check ;;
     server)             cmd_server ;;
@@ -957,10 +1082,10 @@ main() {
     install-systemd)    cmd_install_systemd ;;
     uninstall-systemd)  cmd_uninstall_systemd ;;
     config)             shift; cmd_config "$@" ;;
-    reset-state)        cmd_reset_state ;;
+    reset-state)        shift; cmd_reset_state "$@" ;;
     clear-cache)        cmd_clear_cache ;;
     prune-logs)         shift; cmd_prune_logs "$@" ;;
-    version|-V|--version) echo "ijsi $IJSI_VERSION" ;;
+    version|-V|--version) cmd_version ;;
     -h|--help|help)     usage ;;
     *)
       echo "Unknown command: $1" >&2
