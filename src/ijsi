@@ -1,30 +1,62 @@
 #!/usr/bin/env bash
 #
-# ijsi - JetBrains shared-index manager
+# ijsi - JetBrains shared-index manager for a fleet of PHP API forks
+# ============================================================================
 #
-# Generates JetBrains "shared indexes" for your projects so that opening one in
-# PhpStorm / WebStorm / GoLand / DataGrip reuses a prebuilt index instead of
-# analysing from scratch. Indexes are uploaded to a MinIO (S3-compatible) bucket
-# and each project gets an intellij.yaml pointing the IDE at that bucket, so the
-# whole team downloads the same indexes.
+# WHAT THIS DOES
+#   You keep a single folder of forked PHP/Laravel API repositories (one fork
+#   per project). On demand, ijsi walks that folder and, for each repo:
 #
-# Hosting model:
-#   * MinIO/S3 (default once configured): `refresh` generates indexes and uploads
-#     only the changed files with `mc mirror`. Each project's intellij.yaml is
-#     written with the bucket's PUBLIC base-url, so it is correct to commit to VCS.
-#   * Local test server (fallback): with upload disabled, indexes are served from
-#     http://127.0.0.1:<port> via `ijsi server` for trying things out locally.
+#       1. fetches and fast-forwards the repo's default branch ("main"),
+#       2. runs `composer install` so vendor/ matches the committed lock,
+#       3. generates a JetBrains shared index with the PhpStorm CLI, and
+#       4. uploads the index to a MinIO (S3-compatible) bucket.
 #
-# Reindexing is on demand: run `ijsi refresh` (or the TUI). There is no timer.
+#   Each repo also gets an intellij.yaml pointing PhpStorm at that bucket, so
+#   every developer downloads the prebuilt index instead of analysing the
+#   project (and its vendor/ dependencies) from scratch.
 #
-# Credentials live in mc's own store (`mc alias set` -> ~/.mc/config.json, mode
-# 0600). ijsi never writes the secret key to its own config file.
+# WHY THE VENDOR DIRECTORY STOPS BEING RE-ANALYSED
+#   PhpStorm treats every vendor/* package as a LIBRARY ROOT, and libraries are
+#   indexed even though they are "excluded" content. JetBrains shared indexes
+#   are matched to a developer's files by the HASH OF EACH FILE'S CONTENTS, not
+#   by path. So a vendor file is only covered by a shared index when its bytes
+#   are identical to the bytes that existed when the index was generated.
 #
-# Run with no arguments to open the TUI. Run `ijsi help` for the CLI.
+#   By generating the index here AFTER `composer install` (from the committed
+#   composer.lock), the published index covers vendor/. A teammate gets that
+#   coverage as long as they `composer install` from the SAME composer.lock on
+#   a compatible PHP version/platform - the normal case. New packages change
+#   composer.lock, which is exactly what re-triggers indexing (see below).
+#
+# WHEN IT RE-INDEXES
+#   Re-indexing is on demand (`ijsi refresh`); there is no timer. A repo is
+#   re-indexed only when its fingerprint changes. The fingerprint is a hash of:
+#       - the tracked tree of origin/<default-branch> EXCLUDING intellij.yaml,
+#       - composer.lock + composer.json (new packages => re-index),
+#       - the PhpStorm build, and
+#       - the published base-url.
+#   intellij.yaml is excluded on purpose so that merging the "intellij.yaml fix"
+#   PRs ijsi opens never triggers a re-index loop. `ijsi refresh --force`
+#   ignores the fingerprint and re-indexes everything.
+#
+# THE intellij.yaml PR FLOW
+#   intellij.yaml must be committed so the whole team inherits the shared-index
+#   config. ijsi never commits to your default branch directly: when the
+#   generated intellij.yaml differs from the branch, it pushes a stable branch
+#   `ijsi/intellij-yaml` and opens (or updates) a PR titled "intellij.yaml fix"
+#   via the `gh` CLI. You review and merge. (Configurable: INTELLIJ_YAML_VCS.)
+#
+# CREDENTIALS
+#   S3 credentials live in mc's own store (`mc alias set` -> ~/.mc/config.json,
+#   mode 0600). ijsi never writes the secret key to its own config file.
+#
+# USAGE
+#   Run with no arguments to open the TUI. Run `ijsi help` for the CLI.
 
 set -uo pipefail
 
-IJSI_VERSION="3.0.0"
+IJSI_VERSION="4.0.0"
 
 SELF="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 
@@ -35,25 +67,17 @@ SELF="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}/ijsi"
 CONFIG_FILE="${IJSI_CONFIG:-$CONFIG_HOME/config}"
 
-DEFAULT_PORT=25561
+DEFAULT_REPOS_DIR="$HOME/Main"
 DEFAULT_CACHE_DIR="$HOME/.cache/ij-shared-indexes"
 DEFAULT_TOOLBOX_APPS="$HOME/.local/share/JetBrains/Toolbox/apps"
 DEFAULT_S3_ALIAS="ijsi"
-DEFAULT_PROJECT_ROOTS=(
-  "$HOME/PhpstormProjects"
-  "$HOME/WebstormProjects"
-  "$HOME/GoLandProjects"
-  "$HOME/DatagripProjects"
-)
 
 # Set by the config file if present; left empty here so env/defaults can win.
-PORT="" ; CACHE_DIR="" ; CLI="" ; MC="" ; TOOLBOX_APPS=""
-PHPSTORM_IDE="" ; WEBSTORM_IDE="" ; DATAGRIP_IDE="" ; GOLAND_IDE=""
-PROJECT_ROOTS=()
-EXTRA_PROJECTS=()
+REPOS_DIR="" ; CACHE_DIR="" ; CLI="" ; MC="" ; COMPOSER="" ; TOOLBOX_APPS=""
+PHPSTORM_IDE="" ; DEFAULT_BRANCH="" ; INTELLIJ_YAML_VCS=""
 
 # MinIO / S3 upload (no secrets here - those live in mc's alias store).
-S3_ENABLED="" ; S3_ALIAS="" ; S3_ENDPOINT="" ; S3_BUCKET="" ; S3_PREFIX="" ; PUBLIC_BASE_URL=""
+S3_ALIAS="" ; S3_ENDPOINT="" ; S3_BUCKET="" ; S3_PREFIX="" ; PUBLIC_BASE_URL=""
 
 load_config() {
   if [[ -f "$CONFIG_FILE" ]]; then
@@ -63,13 +87,20 @@ load_config() {
 }
 
 apply_env_and_defaults() {
+  REPOS_DIR="${IJSI_REPOS_DIR:-${REPOS_DIR:-$DEFAULT_REPOS_DIR}}"
   CLI="${IJSI_CLI:-${CLI:-ij-shared-indexes-tool-cli}}"
   MC="${IJSI_MC:-${MC:-mc}}"
-  PORT="${IJSI_PORT:-${PORT:-$DEFAULT_PORT}}"
+  COMPOSER="${IJSI_COMPOSER:-${COMPOSER:-composer}}"
   CACHE_DIR="${IJSI_CACHE_DIR:-${CACHE_DIR:-$DEFAULT_CACHE_DIR}}"
   TOOLBOX_APPS="${IJSI_TOOLBOX_APPS:-${TOOLBOX_APPS:-$DEFAULT_TOOLBOX_APPS}}"
 
-  S3_ENABLED="${IJSI_S3_ENABLED:-${S3_ENABLED:-no}}"
+  # "auto" (detect from Toolbox/opt) or an absolute install dir.
+  PHPSTORM_IDE="${IJSI_PHPSTORM_IDE:-${PHPSTORM_IDE:-auto}}"
+  # Branch to track per repo. Empty = auto-detect origin/HEAD (then main, master).
+  DEFAULT_BRANCH="${IJSI_DEFAULT_BRANCH:-${DEFAULT_BRANCH:-}}"
+  # How to get intellij.yaml into VCS: pr | leave | off
+  INTELLIJ_YAML_VCS="${IJSI_INTELLIJ_YAML_VCS:-${INTELLIJ_YAML_VCS:-pr}}"
+
   S3_ALIAS="${IJSI_S3_ALIAS:-${S3_ALIAS:-$DEFAULT_S3_ALIAS}}"
   S3_ENDPOINT="${IJSI_S3_ENDPOINT:-${S3_ENDPOINT:-}}"
   S3_BUCKET="${IJSI_S3_BUCKET:-${S3_BUCKET:-}}"
@@ -80,43 +111,28 @@ apply_env_and_defaults() {
   STATE_DIR="$CACHE_DIR/state"
   LOG_DIR="$CACHE_DIR/logs"
   CONFIG_DIR="$CACHE_DIR/configs"
-  SYSTEMD_DIR="$HOME/.config/systemd/user"
+  PRWT_DIR="$CACHE_DIR/pr-worktrees"
 
-  if [[ ${#PROJECT_ROOTS[@]} -eq 0 ]]; then
-    PROJECT_ROOTS=( "${DEFAULT_PROJECT_ROOTS[@]}" )
-  fi
+  # Resolved PhpStorm install dir actually passed to the CLI.
+  PHPSTORM_HOME="$(resolve_phpstorm "$PHPSTORM_IDE")"
 
-  # Raw IDE settings: "auto" (detect) or an absolute install dir.
-  PHPSTORM_IDE="${IJSI_PHPSTORM_IDE:-${PHPSTORM_IDE:-auto}}"
-  WEBSTORM_IDE="${IJSI_WEBSTORM_IDE:-${WEBSTORM_IDE:-auto}}"
-  DATAGRIP_IDE="${IJSI_DATAGRIP_IDE:-${DATAGRIP_IDE:-auto}}"
-  GOLAND_IDE="${IJSI_GOLAND_IDE:-${GOLAND_IDE:-auto}}"
-
-  # Resolved install dirs actually passed to the CLI.
-  PHPSTORM_HOME="$(resolve_ide "$PHPSTORM_IDE" phpstorm.sh)"
-  WEBSTORM_HOME="$(resolve_ide "$WEBSTORM_IDE" webstorm.sh)"
-  DATAGRIP_HOME="$(resolve_ide "$DATAGRIP_IDE" datagrip.sh)"
-  GOLAND_HOME="$(resolve_ide "$GOLAND_IDE" goland.sh)"
-
-  # The base-url baked into intellij.yaml and passed to the CLI when generating.
-  BASE_URL="$(effective_base_url)"
+  # The base-url baked into intellij.yaml and passed to the CLI when generating:
+  # always the public MinIO bucket URL (there is no local-server mode any more).
+  BASE_URL="$(s3_public_base_url)"
 }
 
-resolve_ide() {
-  local configured="$1" launcher="$2"
-
+# Find a PhpStorm install. Explicit absolute path wins; "auto" searches Toolbox.
+resolve_phpstorm() {
+  local configured="$1"
   if [[ -n "$configured" && "$configured" != "auto" ]]; then
-    printf '%s' "$configured"
-    return 0
+    printf '%s' "$configured"; return 0
   fi
-
   local r found=""
   for r in "$TOOLBOX_APPS" "$HOME/.local/share/JetBrains" "/opt"; do
     [[ -d "$r" ]] || continue
-    found="$(find "$r" -maxdepth 8 -type f -name "$launcher" 2>/dev/null | sort -V | tail -n 1)"
+    found="$(find "$r" -maxdepth 8 -type f -name phpstorm.sh 2>/dev/null | sort -V | tail -n 1)"
     if [[ -n "$found" ]]; then
-      printf '%s' "$(dirname "$(dirname "$found")")"
-      return 0
+      printf '%s' "$(dirname "$(dirname "$found")")"; return 0
     fi
   done
   printf ''
@@ -130,9 +146,10 @@ resolve_ide() {
 # reverse proxy); otherwise derive it from endpoint + bucket + prefix.
 s3_public_base_url() {
   if [[ -n "$PUBLIC_BASE_URL" ]]; then
-    printf '%s' "${PUBLIC_BASE_URL%/}"
-    return
+    printf '%s' "${PUBLIC_BASE_URL%/}"; return
   fi
+  # Without an endpoint there is no valid base-url; never emit a host-less "/bucket".
+  [[ -n "$S3_ENDPOINT" ]] || return 0
   local u="${S3_ENDPOINT%/}"
   [[ -n "$S3_BUCKET" ]] && u="$u/$S3_BUCKET"
   [[ -n "$S3_PREFIX" ]] && u="$u/${S3_PREFIX#/}"
@@ -146,64 +163,48 @@ s3_target() {
   printf '%s' "$t"
 }
 
-# The base-url actually used when generating indexes: the public bucket URL when
-# uploading is on, otherwise the local test server.
-effective_base_url() {
-  if [[ "$S3_ENABLED" == "yes" ]]; then
-    s3_public_base_url
-  else
-    printf 'http://127.0.0.1:%s' "$PORT"
-  fi
-}
-
 ensure_dirs() {
-  mkdir -p "$CONFIG_HOME" "$DATA_DIR" "$STATE_DIR" "$LOG_DIR" "$CONFIG_DIR"
+  mkdir -p "$CONFIG_HOME" "$DATA_DIR" "$STATE_DIR" "$LOG_DIR" "$CONFIG_DIR" "$PRWT_DIR"
 }
 
 save_config() {
   mkdir -p "$CONFIG_HOME"
-  # Write under a tight umask so the file is never momentarily world-readable.
+  # Tighten an existing config's perms BEFORE truncating it, so a previously
+  # loose-perms file is never briefly readable while we rewrite it.
+  [[ -f "$CONFIG_FILE" ]] && chmod 600 "$CONFIG_FILE" 2>/dev/null
+  # Write under a tight umask so a new file is never momentarily world-readable.
   local oldmask; oldmask="$(umask)"
   umask 077
   {
     printf '# ijsi configuration  -  sourced as bash. IJSI_* env vars override these.\n'
     printf '# Edit by hand, or via:  ijsi  ->  Configure / MinIO settings.\n'
     printf '# NOTE: S3 credentials are NOT stored here; they live in mc (~/.mc/config.json).\n\n'
-    printf 'PORT=%q\n' "$PORT"
+    printf '# Folder containing your forked API repositories (one repo per subfolder).\n'
+    printf 'REPOS_DIR=%q\n\n' "$REPOS_DIR"
     printf 'CACHE_DIR=%q\n' "$CACHE_DIR"
     printf 'CLI=%q\n' "$CLI"
     printf 'MC=%q\n' "$MC"
+    printf 'COMPOSER=%q\n' "$COMPOSER"
     printf 'TOOLBOX_APPS=%q\n\n' "$TOOLBOX_APPS"
+    printf '# PhpStorm install dir: "auto" detects from Toolbox, or set an absolute path.\n'
+    printf 'PHPSTORM_IDE=%q\n' "$PHPSTORM_IDE"
+    printf '# Branch to track per repo. Empty = auto-detect (origin/HEAD, then main/master).\n'
+    printf 'DEFAULT_BRANCH=%q\n' "$DEFAULT_BRANCH"
+    printf '# How intellij.yaml reaches VCS:  pr (open a PR) | leave (write only) | off.\n'
+    printf 'INTELLIJ_YAML_VCS=%q\n\n' "$INTELLIJ_YAML_VCS"
     printf '# MinIO / S3 upload (mc alias holds the access/secret keys).\n'
-    printf 'S3_ENABLED=%q\n' "$S3_ENABLED"
     printf 'S3_ALIAS=%q\n' "$S3_ALIAS"
     printf 'S3_ENDPOINT=%q\n' "$S3_ENDPOINT"
     printf 'S3_BUCKET=%q\n' "$S3_BUCKET"
     printf 'S3_PREFIX=%q\n' "$S3_PREFIX"
     printf '# Override the public download URL (blank = derive from endpoint+bucket+prefix).\n'
-    printf 'PUBLIC_BASE_URL=%q\n\n' "$PUBLIC_BASE_URL"
-    printf '# IDE install dir: "auto" detects from Toolbox, or set an absolute path.\n'
-    printf 'PHPSTORM_IDE=%q\n' "$PHPSTORM_IDE"
-    printf 'WEBSTORM_IDE=%q\n' "$WEBSTORM_IDE"
-    printf 'DATAGRIP_IDE=%q\n' "$DATAGRIP_IDE"
-    printf 'GOLAND_IDE=%q\n\n' "$GOLAND_IDE"
-    printf 'PROJECT_ROOTS=(\n'
-    local r
-    for r in "${PROJECT_ROOTS[@]}"; do printf '  %q\n' "$r"; done
-    printf ')\n'
-    if [[ ${#EXTRA_PROJECTS[@]} -gt 0 ]]; then
-      printf '\nEXTRA_PROJECTS=(\n'
-      for r in "${EXTRA_PROJECTS[@]}"; do printf '  %q\n' "$r"; done
-      printf ')\n'
-    fi
+    printf 'PUBLIC_BASE_URL=%q\n' "$PUBLIC_BASE_URL"
   } > "$CONFIG_FILE"
   umask "$oldmask"
   chmod 600 "$CONFIG_FILE" 2>/dev/null || true
 }
 
-save_config_if_missing() {
-  [[ -f "$CONFIG_FILE" ]] || save_config
-}
+save_config_if_missing() { [[ -f "$CONFIG_FILE" ]] || save_config; }
 
 # ---------------------------------------------------------------------------
 # Colours (CLI only, when stdout is a TTY)
@@ -220,8 +221,10 @@ fi
 # Helpers
 # ---------------------------------------------------------------------------
 
-have_cli() { command -v "$CLI" >/dev/null 2>&1; }
-have_mc()  { command -v "$MC"  >/dev/null 2>&1; }
+have_cli()      { command -v "$CLI" >/dev/null 2>&1; }
+have_mc()       { command -v "$MC"  >/dev/null 2>&1; }
+have_composer() { command -v "$COMPOSER" >/dev/null 2>&1; }
+have_gh()       { command -v gh >/dev/null 2>&1; }
 
 run_low_priority() {
   if command -v ionice >/dev/null 2>&1; then
@@ -233,82 +236,144 @@ run_low_priority() {
 
 sanitize_id() { printf '%s' "$1" | tr -cs 'A-Za-z0-9._-' '-'; }
 
-project_kind() {
-  local project="$1"
-
-  if [[ -f "$project/go.mod" || -f "$project/go.work" ]]; then
-    echo "goland"; return
-  fi
-  if [[ -f "$project/artisan" || -f "$project/composer.json" || -f "$project/composer.lock" ]]; then
-    echo "phpstorm"; return
-  fi
-  if [[ -f "$project/package.json" || -f "$project/pnpm-lock.yaml" || -f "$project/yarn.lock" \
-        || -f "$project/bun.lock" || -f "$project/bun.lockb" \
-        || -f "$project/vite.config.ts" || -f "$project/vite.config.js" ]]; then
-    echo "webstorm"; return
-  fi
-  if [[ -f "$project/.idea/dataSources.xml" ]] || find "$project" -maxdepth 2 -type f -name '*.sql' 2>/dev/null | grep -q .; then
-    echo "datagrip"; return
-  fi
-  echo "webstorm"
+# Collision-resistant per-repo id: sanitized basename + a short hash of the
+# absolute path, so two repos whose names differ only in punctuation (e.g.
+# "api.billing" vs "api-billing") never share a state file or PR worktree.
+repo_id_for() {
+  local repo="$1" abs
+  abs="$(cd "$repo" 2>/dev/null && pwd -P || printf '%s' "$repo")"
+  printf '%s-%s' "$(sanitize_id "$(basename "$abs")")" "$(printf '%s' "$abs" | sha256sum | cut -c1-8)"
 }
 
-ide_for_kind() {
-  case "$1" in
-    phpstorm) printf '%s' "$PHPSTORM_HOME" ;;
-    webstorm) printf '%s' "$WEBSTORM_HOME" ;;
-    datagrip) printf '%s' "$DATAGRIP_HOME" ;;
-    goland)   printf '%s' "$GOLAND_HOME" ;;
-    *)        printf '' ;;
-  esac
+# A repo is a candidate when it is a git working tree containing a PHP project.
+is_repo() {
+  local p="$1"
+  [[ -d "$p/.git" ]] && { [[ -f "$p/composer.json" || -f "$p/artisan" ]]; }
 }
 
-# The fingerprint decides whether a project needs re-indexing. It must be stable
-# across runs for an unchanged project, so it contains nothing the indexer itself
-# rewrites: we drop all .idea/*.xml and *.iml hashing (regenerated every run) and
-# exclude .idea / intellij.yaml from `git status`. What remains genuinely affects
-# the produced index or its published URL: the IDE version, the committed source,
-# uncommitted tracked changes, dependency/build manifests, and the base-url (so
-# switching hosting/public URL re-emits a correct intellij.yaml everywhere).
-project_fingerprint() {
-  local project="$1" ide="$2"
+# Every candidate repo directly under REPOS_DIR, de-duplicated, sorted.
+iter_repos() {
+  [[ -d "$REPOS_DIR" ]] || return 0
+  local d
+  for d in "$REPOS_DIR"/*; do
+    [[ -d "$d" ]] || continue
+    is_repo "$d" && printf '%s\n' "$d"
+  done | sort -u
+}
 
-  (
-    cd "$project" 2>/dev/null || { printf 'unreadable=%s\n' "$project"; exit 0; }
+count_repos() { iter_repos | wc -l | tr -d ' '; }
 
-    printf 'project=%s\n' "$(pwd -P)"
+# Resolve a CLI argument (basename, path fragment, or absolute path) to one repo.
+resolve_repo_arg() {
+  local arg="$1" p
+  if [[ -d "$arg" ]] && is_repo "$arg"; then
+    printf '%s' "$(readlink -f "$arg")"; return 0
+  fi
+  local match=""
+  while IFS= read -r p; do
+    [[ "$(basename "$p")" == "$arg" ]] && { printf '%s' "$p"; return 0; }   # exact wins
+    [[ -z "$match" && "$(basename "$p")" == *"$arg"* ]] && match="$p"        # basename fragment
+  done < <(iter_repos)
+  [[ -n "$match" ]] && { printf '%s' "$match"; return 0; }
+  return 1
+}
+
+# True if the repo basename matches any name in a comma-separated --only list.
+match_only() {
+  local repo="$1" csv="$2" base n
+  base="$(basename "$repo")"
+  local IFS=','
+  for n in $csv; do
+    [[ -z "$n" ]] && continue
+    # Match on the repo basename only - never the full path, so a fragment that
+    # happens to appear in REPOS_DIR (e.g. "api") cannot over-select every repo.
+    [[ "$base" == "$n" || "$base" == *"$n"* ]] && return 0
+  done
+  return 1
+}
+
+record_result() {
+  [[ -n "${IJSI_RESULTS:-}" ]] && printf '%s\t%s\n' "$1" "$2" >> "$IJSI_RESULTS"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Git: default branch + fast-forward update
+# ---------------------------------------------------------------------------
+
+# The branch we treat as "main" for a repo. DEFAULT_BRANCH overrides; otherwise
+# origin/HEAD, then a present origin/main or origin/master, else "main".
+repo_default_branch() {
+  local repo="$1" b
+  if [[ -n "$DEFAULT_BRANCH" ]]; then printf '%s' "$DEFAULT_BRANCH"; return; fi
+  b="$(git -C "$repo" symbolic-ref --short -q refs/remotes/origin/HEAD 2>/dev/null)"
+  if [[ -z "$b" ]]; then
+    git -C "$repo" remote set-head origin -a >/dev/null 2>&1
+    b="$(git -C "$repo" symbolic-ref --short -q refs/remotes/origin/HEAD 2>/dev/null)"
+  fi
+  if [[ -n "$b" ]]; then printf '%s' "${b#origin/}"; return; fi
+  if git -C "$repo" show-ref --verify --quiet refs/remotes/origin/main;   then printf 'main';   return; fi
+  if git -C "$repo" show-ref --verify --quiet refs/remotes/origin/master; then printf 'master'; return; fi
+  printf 'main'
+}
+
+# Check out <branch> and fast-forward it to origin/<branch>. Our own regenerated
+# intellij.yaml is discarded first so it never blocks the fast-forward. Returns
+# non-zero (without mutating further) if the working tree has other local
+# changes, or the branch has diverged from origin - the caller then skips it.
+update_repo() {
+  local repo="$1" branch="$2"
+  # Only operate when the repo is ALREADY on its default branch - never switch a
+  # developer's working branch out from under them. Caller reports the skip.
+  local current
+  current="$(git -C "$repo" symbolic-ref --short -q HEAD 2>/dev/null || true)"
+  [[ "$current" == "$branch" ]] || return 1
+  # Now safe: discard our own regenerated intellij.yaml so it can't block the ff.
+  git -C "$repo" checkout -- intellij.yaml 2>/dev/null || true
+  git -C "$repo" merge --ff-only "origin/$branch" >/dev/null 2>&1 || return 1
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Fingerprint - decides whether a repo needs re-indexing
+# ---------------------------------------------------------------------------
+
+# Stable across runs for an unchanged main branch. It deliberately excludes
+# intellij.yaml (so merging ijsi's own PRs never re-triggers indexing) and is
+# computed from the COMMITTED tree of origin/<branch> (not the working tree), so
+# the indexer rewriting files locally cannot invalidate us. composer.lock /
+# composer.json are folded in explicitly so "new packages" always re-indexes.
+repo_fingerprint() {
+  local repo="$1" branch="$2" ide="$3" tree
+  # Committed tree of the tracked branch, minus the IDE-managed intellij.yaml
+  # (so merging our own intellij.yaml PR never changes the fingerprint). ls-tree
+  # lines are "<mode> <type> <objectid>\t<path>"; the awk filter drops the row
+  # whose PATH is intellij.yaml. pipefail makes this fail if ls-tree errors, so a
+  # transient git failure aborts rather than silently dropping the source state.
+  tree="$(git -C "$repo" ls-tree -r "origin/$branch" 2>/dev/null | awk -F'\t' '$2 != "intellij.yaml"')" || return 1
+  {
     printf 'ide=%s\n' "$ide"
     printf 'baseurl=%s\n' "${BASE_URL:-}"
-
-    # IDE version: Toolbox path encodes the build, and product-info.json is
-    # stable per version -> re-index on IDE upgrade, not on every run.
-    [[ -n "$ide" && -f "$ide/product-info.json" ]] && sha256sum "$ide/product-info.json"
-
-    # Committed state + uncommitted TRACKED changes, excluding IDE/session churn
-    # so the indexer rewriting .idea / intellij.yaml never invalidates us.
-    git rev-parse HEAD 2>/dev/null || true
-    git status --porcelain=v1 -uno -- . ':(exclude).idea' ':(exclude)intellij.yaml' 2>/dev/null || true
-
-    # Dependency / build manifests that change what gets indexed.
+    # Hash file contents via stdin so the (machine-specific) path is NOT embedded
+    # in the digest - moving REPOS_DIR then does not force a full re-index.
+    [[ -n "$ide" && -f "$ide/product-info.json" ]] && sha256sum < "$ide/product-info.json"
+    printf '%s\n' "$tree"
+    # Dependency manifests (also covers a repo that, unusually, gitignores them).
     local f
-    for f in \
-      composer.json composer.lock \
-      package.json package-lock.json pnpm-lock.yaml pnpm-workspace.yaml yarn.lock bun.lock bun.lockb \
-      go.mod go.sum go.work go.work.sum \
-      tsconfig.json tsconfig.app.json jsconfig.json \
-      vite.config.js vite.config.ts \
-      .nvmrc .tool-versions
-    do
-      [[ -f "$f" ]] && sha256sum "$f"
+    for f in composer.lock composer.json; do
+      [[ -f "$repo/$f" ]] && sha256sum < "$repo/$f"
     done
-  ) | sha256sum | awk '{print $1}'
+  } | sha256sum | awk '{print $1}'
 }
+
+# ---------------------------------------------------------------------------
+# intellij.yaml extraction / merge / VCS
+# ---------------------------------------------------------------------------
 
 # Pull the shared-index YAML block out of the CLI's stdout. The CLI prints the
 # `sharedIndex:` (and, for automatic download, `consents:`) section to paste into
 # <project>/intellij.yaml. We capture from the first such top-level key through
-# the contiguous YAML (indented lines, list items, and sibling top-level keys),
-# stopping at the first non-YAML log line or a run of blank lines.
+# the contiguous YAML, stopping at the first non-YAML log line or a run of blanks.
 extract_intellij_yaml() {
   local log_file="$1" out_file="$2"
   awk '
@@ -333,14 +398,11 @@ extract_intellij_yaml() {
 }
 
 # intellij.yaml is a general IntelliJ project-settings file: `sharedIndex` is just
-# one of several top-level sections (compiler, versionControl, repositoryLibrary,
-# ...) a team may legitimately commit. So we MERGE rather than overwrite: keep all
-# of the existing file's top-level keys except the shared-index ones we manage,
-# then append the freshly generated block. This preserves the order-independent
-# top-level keys; it does not attempt deep YAML merging (none is needed here).
+# one of several top-level sections a team may legitimately commit. So we MERGE
+# rather than overwrite: keep all of the existing file's top-level keys except the
+# shared-index ones we manage, then append the freshly generated block.
 merge_intellij_yaml() {
   local existing="$1" block="$2" out="$3"
-
   if [[ -f "$existing" ]]; then
     awk '
       function topkey(l,   k) {
@@ -352,203 +414,256 @@ merge_intellij_yaml() {
         k = topkey($0)
         if (k != "")          dropping = (k in drop)
         else if ($0 ~ /^#/)   dropping = 0   # a column-0 comment starts a fresh section
-        if (!dropping) print
+        if (dropping) next
+        # Buffer blank lines and only emit them once a real line follows. This drops
+        # trailing blanks (e.g. the separator that preceded a removed block), so the
+        # merge is a FIXED POINT: merge(merge(x)) == merge(x). Without this, each run
+        # would accrue a blank line and trigger a needless intellij.yaml PR push.
+        if ($0 ~ /^[[:space:]]*$/) { pending++; next }
+        for (; pending > 0; pending--) print ""
+        print
       }
     ' "$existing" > "$out"
   else
     : > "$out"
   fi
-
-  # Separate preserved content from the appended block with a blank line.
+  # Exactly one blank line separates preserved content from the appended block.
   [[ -s "$out" ]] && printf '\n' >> "$out"
   cat "$block" >> "$out"
 }
 
-is_loopback_url() {
-  # True when the URL host is localhost/loopback -> intellij.yaml is machine-local.
-  case "$1" in
-    *://127.0.0.1*|*://localhost*|*://[::1]*|*://0.0.0.0*) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-# Per the JetBrains docs, intellij.yaml should be committed so the team inherits
-# the shared-index config -- but ONLY when the server URL is reachable by the
-# team. A loopback URL (127.0.0.1/localhost) resolves to each developer's OWN
-# machine, so committing it would break everyone else. So: for a loopback
-# base-url we git-exclude the file; for a real shared/remote (e.g. MinIO) URL we
-# leave it tracked and tell you to commit it.
-handle_intellij_yaml_vcs() {
-  local project="$1"
-  [[ -d "$project/.git" ]] || return 0
-  mkdir -p "$project/.git/info"
-  touch "$project/.git/info/exclude"
-
-  if is_loopback_url "$BASE_URL"; then
-    if ! grep -qx '/intellij.yaml' "$project/.git/info/exclude"; then
-      printf '\n/intellij.yaml\n' >> "$project/.git/info/exclude"
-    fi
-    printf '       localhost URL -> kept out of VCS (.git/info/exclude)\n'
-  else
-    if grep -qx '/intellij.yaml' "$project/.git/info/exclude"; then
-      grep -vx '/intellij.yaml' "$project/.git/info/exclude" > "$project/.git/info/exclude.ijsi.tmp" \
-        && mv "$project/.git/info/exclude.ijsi.tmp" "$project/.git/info/exclude"
-    fi
-    printf '       shared URL -> commit %s/intellij.yaml so your team gets the indexes\n' "$project"
+# Make sure a previous ijsi version's git-exclude of intellij.yaml is undone, so
+# the file is tracked (committable) again. Only touches the local exclude file.
+unignore_intellij_yaml() {
+  local repo="$1" ex="$repo/.git/info/exclude"
+  [[ -f "$ex" ]] || return 0
+  if grep -qx '/intellij.yaml' "$ex" 2>/dev/null; then
+    # grep -v exits 1 when it removes the only line (no output); do not gate the
+    # mv on that, or the exclude entry would survive. An empty exclude file is ok.
+    { grep -vx '/intellij.yaml' "$ex" > "$ex.ijsi.tmp" 2>/dev/null || true; }
+    mv "$ex.ijsi.tmp" "$ex" 2>/dev/null || rm -f "$ex.ijsi.tmp"
   fi
 }
 
-is_project_dir() {
-  local p="$1"
-  [[ -d "$p/.idea" || -f "$p/composer.json" || -f "$p/package.json" \
-     || -f "$p/go.mod" || -f "$p/go.work" || -f "$p/artisan" ]]
+intellij_pr_body() {
+  cat <<'EOF'
+Adds/updates `intellij.yaml` so PhpStorm downloads the team's prebuilt JetBrains
+shared index (project sources + vendor dependencies) from the MinIO bucket
+instead of indexing the project from scratch.
+
+Generated automatically by `ijsi`. This PR changes only `intellij.yaml`. Safe to
+merge after a glance. The `ijsi/intellij-yaml` branch is managed by ijsi and is
+force-pushed on each update - please don't push your own commits to it.
+EOF
 }
 
-iter_projects() {
-  {
-    local root project p
-    for root in "${PROJECT_ROOTS[@]}"; do
-      [[ -d "$root" ]] || continue
-      for project in "$root"/*; do
-        [[ -d "$project" ]] || continue
-        is_project_dir "$project" && printf '%s\n' "$project"
-      done
-    done
-    for p in "${EXTRA_PROJECTS[@]:-}"; do
-      [[ -n "$p" && -d "$p" ]] && printf '%s\n' "$p"
-    done
-  } | awk 'NF && !seen[$0]++'
-}
+# Open or update a PR that lands the regenerated intellij.yaml on the default
+# branch. Idempotent and non-spammy: does nothing when the branch already has the
+# same content, and reuses an existing open PR. Uses a throwaway git worktree so
+# the repo's own checkout / indexed state is never disturbed.
+open_intellij_pr() {
+  local repo="$1" branch="$2" name="$3"
+  local gen="$repo/intellij.yaml"
+  [[ -f "$gen" ]] || return 0
 
-match_only() {
-  local project="$1" csv="$2" base n
-  base="$(basename "$project")"
-  local IFS=','
-  for n in $csv; do
-    [[ -z "$n" ]] && continue
-    [[ "$base" == "$n" || "$project" == *"$n"* ]] && return 0
-  done
-  return 1
-}
-
-count_projects() { iter_projects | wc -l | tr -d ' '; }
-
-# Resolve a CLI argument (a project basename, a path fragment, or an absolute
-# path) to a single discovered project directory.
-resolve_project_arg() {
-  local arg="$1" p
-  if [[ -d "$arg" ]] && is_project_dir "$arg"; then
-    printf '%s' "$(readlink -f "$arg")"; return 0
+  if ! have_gh; then
+    printf '       %sNote%s gh CLI not found - skipping intellij.yaml PR (install gh, or set INTELLIJ_YAML_VCS=leave)\n' "$C_YELLOW" "$C_RESET"
+    return 0
   fi
-  while IFS= read -r p; do
-    [[ "$(basename "$p")" == "$arg" || "$p" == *"$arg"* ]] && { printf '%s' "$p"; return 0; }
-  done < <(iter_projects)
-  return 1
-}
-
-record_result() {
-  [[ -n "${IJSI_RESULTS:-}" ]] && printf '%s\t%s\n' "$1" "$2" >> "$IJSI_RESULTS"
-  return 0
-}
-
-# Returns: 3=indexed  0=up-to-date  4=skipped(no IDE)  1=failed
-index_project() {
-  local project="$1"
-  local kind ide name project_id fingerprint state_file log_file yaml_file
-
-  kind="$(project_kind "$project")"
-  ide="$(ide_for_kind "$kind")"
-  name="$(basename "$project")"
-  project_id="$(sanitize_id "${kind}-${name}")"
-  state_file="$STATE_DIR/${project_id}.sha256"
-
-  if [[ -z "$ide" ]]; then
-    printf '%sSkip%s   %s  (%s IDE not found)\n' "$C_YELLOW" "$C_RESET" "$project" "$kind"
-    record_result skipped "$project"
-    return 4
-  fi
-
-  if [[ ! -e "$ide/product-info.json" ]]; then
-    printf '%sSkip%s   %s  (%s IDE looks incomplete: no product-info.json at %s)\n' \
-      "$C_YELLOW" "$C_RESET" "$project" "$kind" "$ide"
-    record_result skipped "$project"
-    return 4
-  fi
-
-  fingerprint="$(project_fingerprint "$project" "$ide")"
-
-  if [[ -z "${IJSI_FORCE:-}" ]] && [[ -f "$state_file" ]] && [[ "$(cat "$state_file")" == "$fingerprint" ]]; then
-    printf '%sOK%s     %s  (up to date)\n' "$C_DIM" "$C_RESET" "$project"
-    record_result uptodate "$project"
+  if ! ( cd "$repo" && gh repo view >/dev/null 2>&1 ); then
+    printf '       %sNote%s no GitHub remote / gh not authed - skipping intellij.yaml PR\n' "$C_YELLOW" "$C_RESET"
     return 0
   fi
 
-  log_file="$LOG_DIR/${project_id}-$(date +%Y%m%d-%H%M%S).log"
-  printf '%sIndex%s  %s  [%s]\n' "$C_BLUE" "$C_RESET" "$project" "$kind"
-
-  if run_low_priority "$CLI" indexes \
-      --ij "$ide" \
-      --project "$project" \
-      --base-url "$BASE_URL" \
-      --data-directory "$DATA_DIR" \
-      > "$log_file" 2>&1
-  then
-    printf '%s\n' "$fingerprint" > "$state_file"
-    # Mark that fresh indexes exist but are not yet on MinIO. Cleared only after a
-    # successful upload, so a failed/interrupted upload is retried on the next run
-    # even though the project itself now fingerprints as up to date.
-    [[ "$S3_ENABLED" == "yes" ]] && touch "$STATE_DIR/.needs_upload"
-
-    yaml_file="$CONFIG_DIR/${project_id}.intellij.yaml"
-    if extract_intellij_yaml "$log_file" "$yaml_file"; then
-      if merge_intellij_yaml "$project/intellij.yaml" "$yaml_file" "$project/.intellij.yaml.ijsi.tmp" \
-         && mv "$project/.intellij.yaml.ijsi.tmp" "$project/intellij.yaml"; then
-        printf '%sDone%s   %s  (merged intellij.yaml -> %s)\n' "$C_GREEN" "$C_RESET" "$project" "$BASE_URL"
-        if [[ "$S3_ENABLED" == "yes" ]] && ! grep -qF "$(s3_public_base_url)" "$project/intellij.yaml"; then
-          printf '       %sWARNING%s intellij.yaml does not reference %s\n' \
-            "$C_YELLOW" "$C_RESET" "$(s3_public_base_url)"
-        fi
-        handle_intellij_yaml_vcs "$project"
-      else
-        rm -f "$project/.intellij.yaml.ijsi.tmp"
-        printf '%sDone%s   %s  (indexed; could not write intellij.yaml)\n' "$C_YELLOW" "$C_RESET" "$project"
-      fi
-    else
-      printf '%sDone%s   %s  (no intellij.yaml in CLI output; see %s)\n' \
-        "$C_GREEN" "$C_RESET" "$project" "$log_file"
-    fi
-    record_result indexed "$project"
-    return 3
-  else
-    printf '%sFail%s   %s  (see %s)\n' "$C_RED" "$C_RESET" "$project" "$log_file"
-    record_result failed "$project"
-    return 1
+  local new cur
+  new="$(cat "$gen")"
+  cur="$(git -C "$repo" show "origin/$branch:intellij.yaml" 2>/dev/null || true)"
+  if [[ "$new" == "$cur" ]]; then
+    printf '       intellij.yaml already current on %s - no PR needed\n' "$branch"
+    return 0
   fi
+
+  local pr_branch="ijsi/intellij-yaml" prcur
+  git -C "$repo" fetch origin "$pr_branch" >/dev/null 2>&1 || true
+  prcur="$(git -C "$repo" show "origin/$pr_branch:intellij.yaml" 2>/dev/null || true)"
+
+  if [[ "$new" != "$prcur" ]]; then
+    # Build the PR commit in a DETACHED throwaway worktree at origin/<branch> and
+    # push it straight to the PR ref. Using a detached worktree (not a named local
+    # branch) means we never collide with a branch that is checked out elsewhere.
+    local wt="$PRWT_DIR/$(repo_id_for "$repo")"
+    rm -rf "$wt"
+    git -C "$repo" worktree prune >/dev/null 2>&1
+    if ! git -C "$repo" worktree add -f --detach "$wt" "origin/$branch" >/dev/null 2>&1; then
+      git -C "$repo" worktree prune >/dev/null 2>&1
+      printf '       %sNote%s could not prepare PR worktree - skipping intellij.yaml PR\n' "$C_YELLOW" "$C_RESET"
+      return 0
+    fi
+    cp "$gen" "$wt/intellij.yaml"
+    git -C "$wt" add -f intellij.yaml >/dev/null 2>&1
+    if git -C "$wt" diff --cached --quiet; then
+      git -C "$repo" worktree remove --force "$wt" >/dev/null 2>&1
+      printf '       intellij.yaml unchanged vs %s - no PR needed\n' "$branch"
+      return 0
+    fi
+    # Use the repo's git identity when set; otherwise fall back to a bot identity
+    # so the commit still succeeds on a host with no configured user.
+    local cargs=(-c commit.gpgsign=false)
+    git -C "$wt" config user.email >/dev/null 2>&1 || cargs+=(-c user.name=ijsi -c user.email=ijsi@localhost)
+    if ! git -C "$wt" "${cargs[@]}" commit -q -m "intellij.yaml fix" >/dev/null 2>&1; then
+      git -C "$repo" worktree remove --force "$wt" >/dev/null 2>&1
+      printf '       %sNote%s could not create the intellij.yaml commit - skipping PR\n' "$C_YELLOW" "$C_RESET"
+      return 0
+    fi
+    if ! git -C "$wt" push -f origin "HEAD:refs/heads/$pr_branch" >/dev/null 2>&1; then
+      git -C "$repo" worktree remove --force "$wt" >/dev/null 2>&1
+      printf '       %sNote%s could not push %s to origin (no push access?) - skipping PR\n' "$C_YELLOW" "$C_RESET" "$pr_branch"
+      return 0
+    fi
+    git -C "$repo" worktree remove --force "$wt" >/dev/null 2>&1
+  fi
+
+  # Only an OPEN PR counts as "already open" - a merged/closed PR for this head
+  # must NOT suppress opening a fresh one for the just-pushed change.
+  local pr_state
+  pr_state="$( cd "$repo" && gh pr view "$pr_branch" --json state -q .state 2>/dev/null )"
+  if [[ "$pr_state" == "OPEN" ]]; then
+    printf '       %sPR%s     intellij.yaml fix already open (branch %s updated)\n' "$C_GREEN" "$C_RESET" "$pr_branch"
+  elif ( cd "$repo" && gh pr create --base "$branch" --head "$pr_branch" \
+            --title "intellij.yaml fix" --body "$(intellij_pr_body)" >/dev/null 2>&1 ); then
+    printf '       %sPR%s     opened "intellij.yaml fix"  (%s -> %s)\n' "$C_GREEN" "$C_RESET" "$pr_branch" "$branch"
+  else
+    printf '       %sNote%s pushed %s but could not open PR (open it manually)\n' "$C_YELLOW" "$C_RESET" "$pr_branch"
+  fi
+}
+
+# Land the regenerated intellij.yaml according to INTELLIJ_YAML_VCS.
+handle_intellij_yaml() {
+  local repo="$1" branch="$2" name="$3"
+  case "$INTELLIJ_YAML_VCS" in
+    off)   : ;;                                   # leave the file, touch nothing
+    leave) unignore_intellij_yaml "$repo" ;;      # tracked + modified; you commit
+    pr|*)  unignore_intellij_yaml "$repo"; open_intellij_pr "$repo" "$branch" "$name" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Index one repo
+# Returns: 3=indexed  0=up-to-date  4=skipped  1=failed
+# ---------------------------------------------------------------------------
+
+index_repo() {
+  local repo="$1"
+  local name ide repo_id fingerprint state_file log_file yaml_file branch rc
+
+  name="$(basename "$repo")"
+  repo_id="$(repo_id_for "$repo")"
+  state_file="$STATE_DIR/${repo_id}.sha256"
+  ide="$PHPSTORM_HOME"
+
+  if [[ -z "$ide" || ! -e "$ide/product-info.json" ]]; then
+    printf '%sSkip%s   %s  (PhpStorm not found; set PHPSTORM_IDE in: ijsi config)\n' "$C_YELLOW" "$C_RESET" "$repo"
+    record_result skipped "$repo"; return 4
+  fi
+
+  # Update to latest main before anything else.
+  if ! git -C "$repo" fetch --prune origin >/dev/null 2>&1; then
+    printf '%sSkip%s   %s  (git fetch failed - no network / remote?)\n' "$C_YELLOW" "$C_RESET" "$repo"
+    record_result skipped "$repo"; return 4
+  fi
+  branch="$(repo_default_branch "$repo")"
+  if ! update_repo "$repo" "$branch"; then
+    printf '%sSkip%s   %s  (not on %s, or dirty/diverged - cannot fast-forward)\n' "$C_YELLOW" "$C_RESET" "$repo" "$branch"
+    record_result skipped "$repo"; return 4
+  fi
+
+  fingerprint="$(repo_fingerprint "$repo" "$branch" "$ide")"
+  if [[ -z "$fingerprint" ]]; then
+    printf '%sSkip%s   %s  (could not compute fingerprint - git error?)\n' "$C_YELLOW" "$C_RESET" "$repo"
+    record_result skipped "$repo"; return 4
+  fi
+  if [[ -z "${IJSI_FORCE:-}" ]] && [[ -f "$state_file" ]] && [[ "$(cat "$state_file")" == "$fingerprint" ]]; then
+    printf '%sOK%s     %s  (up to date on %s)\n' "$C_DIM" "$C_RESET" "$repo" "$branch"
+    record_result uptodate "$repo"; return 0
+  fi
+
+  # Unique per run: a bare seconds timestamp can collide when the same repo is
+  # re-indexed twice in one second, which would make the `>>` below append to the
+  # previous run's log and extract_intellij_yaml then pull the STALE first block.
+  log_file="$(mktemp "$LOG_DIR/${repo_id}-$(date +%Y%m%d-%H%M%S)-XXXXXX.log")"
+  printf '%sIndex%s  %s  [%s]  composer install + shared index\n' "$C_BLUE" "$C_RESET" "$repo" "$branch"
+
+  # 1) composer install so vendor/ matches the committed lock at index time.
+  {
+    printf '===== composer install =====\n'
+    ( cd "$repo" && run_low_priority "$COMPOSER" install --no-interaction --no-progress --prefer-dist )
+  } >> "$log_file" 2>&1
+  rc=$?
+  if [[ $rc -ne 0 ]]; then
+    printf '%sFail%s   %s  (composer install failed; see %s)\n' "$C_RED" "$C_RESET" "$repo" "$log_file"
+    record_result failed "$repo"; return 1
+  fi
+
+  # 2) generate the shared index.
+  {
+    printf '\n===== shared-index generation =====\n'
+    run_low_priority "$CLI" indexes \
+      --ij "$ide" \
+      --project "$repo" \
+      --base-url "$BASE_URL" \
+      --data-directory "$DATA_DIR"
+  } >> "$log_file" 2>&1
+  rc=$?
+  if [[ $rc -ne 0 ]]; then
+    printf '%sFail%s   %s  (indexing failed; see %s)\n' "$C_RED" "$C_RESET" "$repo" "$log_file"
+    record_result failed "$repo"; return 1
+  fi
+
+  printf '%s\n' "$fingerprint" > "$state_file"
+  # Fresh indexes exist but are not yet on MinIO. Cleared only after a successful
+  # upload, so an interrupted upload is retried on the next refresh.
+  touch "$STATE_DIR/.needs_upload"
+
+  # 3) intellij.yaml: extract -> merge -> land via PR (per INTELLIJ_YAML_VCS).
+  yaml_file="$CONFIG_DIR/${repo_id}.intellij.yaml"
+  if extract_intellij_yaml "$log_file" "$yaml_file"; then
+    if merge_intellij_yaml "$repo/intellij.yaml" "$yaml_file" "$repo/.intellij.yaml.ijsi.tmp" \
+       && mv "$repo/.intellij.yaml.ijsi.tmp" "$repo/intellij.yaml"; then
+      printf '%sDone%s   %s  (indexed; intellij.yaml -> %s)\n' "$C_GREEN" "$C_RESET" "$repo" "$BASE_URL"
+      local burl; burl="$(s3_public_base_url)"
+      if [[ -n "$burl" ]] && ! grep -qF "$burl" "$repo/intellij.yaml"; then
+        printf '       %sWARNING%s intellij.yaml does not reference %s\n' "$C_YELLOW" "$C_RESET" "$burl"
+      fi
+      handle_intellij_yaml "$repo" "$branch" "$name"
+    else
+      rm -f "$repo/.intellij.yaml.ijsi.tmp"
+      printf '%sDone%s   %s  (indexed; could not write intellij.yaml)\n' "$C_YELLOW" "$C_RESET" "$repo"
+    fi
+  else
+    printf '%sDone%s   %s  (indexed; no intellij.yaml in CLI output; see %s)\n' "$C_GREEN" "$C_RESET" "$repo" "$log_file"
+  fi
+  record_result indexed "$repo"; return 3
 }
 
 # ---------------------------------------------------------------------------
 # MinIO / S3
 # ---------------------------------------------------------------------------
 
-mc_alias_label()   { mc_alias_configured && echo "configured" || echo "not set"; }
-s3_state_label()   { [[ "$S3_ENABLED" == "yes" ]] && echo "ON (MinIO)" || echo "off (local server)"; }
+mc_alias_label()      { mc_alias_configured && echo "configured" || echo "not set"; }
 mc_alias_configured() { have_mc && "$MC" alias ls "$S3_ALIAS" >/dev/null 2>&1; }
 
 # Register/update the mc alias from credentials. Tries the modern verb first,
-# falls back to the legacy one. The secret is passed on argv (visible only to
-# the same user via /proc) and stored by mc in ~/.mc/config.json, mode 0600.
+# falls back to the legacy one. The secret is stored by mc in ~/.mc/config.json.
 mc_set_alias() {
   local endpoint="$1" access="$2" secret="$3"
   "$MC" alias set "$S3_ALIAS" "$endpoint" "$access" "$secret" >/dev/null 2>&1 \
     || "$MC" config host add "$S3_ALIAS" "$endpoint" "$access" "$secret" >/dev/null 2>&1
 }
 
-# Grant anonymous (public) download on a bucket/prefix. The command was renamed
-# from `mc policy` to `mc anonymous`; try newest -> oldest.
+# Grant anonymous (public) download on a bucket/prefix (the command was renamed
+# from `mc policy` to `mc anonymous`; try newest -> oldest).
 mc_set_public() {
   local target="$1" err
-  # Keep the legacy fallbacks quiet, but surface the modern verb's error (the most
-  # informative one) if every attempt fails.
   err="$("$MC" anonymous set download "$target" 2>&1 >/dev/null)" && return 0
   "$MC" policy set download "$target" >/dev/null 2>&1 && return 0
   "$MC" policy download "$target" >/dev/null 2>&1 && return 0
@@ -558,20 +673,19 @@ mc_set_public() {
 
 # Print one line per readiness problem; return 1 if any, 0 if ready to upload.
 s3_preflight() {
-  local problems=()
-  [[ "$S3_ENABLED" == "yes" ]] || problems+=("upload is disabled (enable it in MinIO settings)")
-  have_mc                      || problems+=("mc not found: $MC (install MinIO Client or set MC)")
-  mc_alias_configured          || problems+=("mc alias '$S3_ALIAS' not configured (set credentials)")
-  [[ -n "$S3_BUCKET" ]]        || problems+=("bucket name not set")
-  [[ -n "$(s3_public_base_url)" ]] || problems+=("public base URL/endpoint not set")
+  local problems=() burl
+  burl="$(s3_public_base_url)"
+  have_mc                          || problems+=("mc not found: $MC (install MinIO Client or set MC)")
+  mc_alias_configured              || problems+=("mc alias '$S3_ALIAS' not configured (run: ijsi s3 login)")
+  [[ -n "$S3_BUCKET" ]]            || problems+=("bucket name not set (ijsi config / TUI)")
+  [[ "$burl" =~ ^[a-zA-Z][a-zA-Z0-9+.-]*:// ]] || problems+=("public base URL has no scheme; set S3_ENDPOINT (https://...) or PUBLIC_BASE_URL")
   if [[ ${#problems[@]} -gt 0 ]]; then
-    printf '%s\n' "${problems[@]}"
-    return 1
+    printf '%s\n' "${problems[@]}"; return 1
   fi
   return 0
 }
 
-# Upload the generated indexes (contents of the server dir) to the bucket.
+# Upload generated indexes (contents of the server dir) to the bucket.
 # mc mirror is incremental: only changed files are transferred.
 s3_publish() {
   local src="$DATA_DIR/server" target
@@ -589,8 +703,7 @@ s3_publish() {
   echo "Uploading shared indexes  $src  ->  $target"
   echo "Public URL: $(s3_public_base_url)"
   if run_low_priority "$MC" mirror --overwrite "$src" "$target"; then
-    echo "Upload complete."
-    return 0
+    echo "Upload complete."; return 0
   fi
   echo "Upload failed (mc mirror). Check 'ijsi s3 test' and the bucket policy." >&2
   return 1
@@ -603,8 +716,6 @@ cmd_s3_setup() {
   [[ -n "$S3_BUCKET" ]] || { echo "Set a bucket name first (ijsi config / TUI)." >&2; return 1; }
 
   echo "Ensuring bucket exists: $S3_ALIAS/$S3_BUCKET"
-  # `mb --ignore-existing` is idempotent: it succeeds if the bucket already exists
-  # and fails loudly (with mc's own error) if creation genuinely fails.
   if ! "$MC" mb --ignore-existing "$S3_ALIAS/$S3_BUCKET"; then
     echo "Could not create or verify bucket $S3_ALIAS/$S3_BUCKET (see mc error above)." >&2
     return 1
@@ -637,8 +748,7 @@ cmd_s3_login() {
     S3_ENDPOINT="$endpoint"; save_config
     echo "Saved credentials to mc alias '$S3_ALIAS' (~/.mc/config.json)."
   else
-    echo "Failed to register the mc alias. Check the endpoint and keys." >&2
-    return 1
+    echo "Failed to register the mc alias. Check the endpoint and keys." >&2; return 1
   fi
 }
 
@@ -646,16 +756,12 @@ cmd_s3_test() {
   have_mc || { echo "mc not found: $MC" >&2; return 1; }
   mc_alias_configured || { echo "Alias '$S3_ALIAS' not configured (ijsi s3 login)." >&2; return 1; }
   echo "Listing $S3_ALIAS ..."
-  if "$MC" ls "$S3_ALIAS"; then
-    echo "Connection OK."
-  else
-    echo "Could not reach $S3_ALIAS. Check endpoint/keys." >&2
-    return 1
+  if "$MC" ls "$S3_ALIAS"; then echo "Connection OK."; else
+    echo "Could not reach $S3_ALIAS. Check endpoint/keys." >&2; return 1
   fi
 }
 
 s3_status() {
-  printf 'Upload enabled:    %s\n' "$S3_ENABLED"
   printf 'mc client:         %s\n' "$(have_mc && command -v "$MC" || echo "not found: $MC")"
   printf 'mc alias:          %s  (%s)\n' "$S3_ALIAS" "$(mc_alias_label)"
   printf 'Endpoint:          %s\n' "${S3_ENDPOINT:-<unset>}"
@@ -663,14 +769,10 @@ s3_status() {
   printf 'Prefix:            %s\n' "${S3_PREFIX:-<none>}"
   printf 'Upload target:     %s\n' "$(s3_target)"
   printf 'Public base URL:   %s\n' "$(s3_public_base_url)"
-  printf 'Effective base:    %s\n' "$(effective_base_url)"
-  if [[ "$S3_ENABLED" == "yes" ]]; then
-    if s3_preflight >/dev/null; then
-      printf 'Readiness:         READY\n'
-    else
-      printf 'Readiness:         NOT READY\n'
-      s3_preflight | sed 's/^/  - /'
-    fi
+  if s3_preflight >/dev/null; then
+    printf 'Readiness:         READY\n'
+  else
+    printf 'Readiness:         NOT READY\n'; s3_preflight | sed 's/^/  - /'
   fi
   [[ -f "$STATE_DIR/.needs_upload" ]] && printf 'Pending upload:    YES (previous upload incomplete; next refresh/sync retries)\n'
   return 0
@@ -683,11 +785,9 @@ cmd_s3() {
     setup)         cmd_s3_setup ;;
     sync|publish)  s3_publish && rm -f "$STATE_DIR/.needs_upload" ;;
     test)          cmd_s3_test ;;
-    enable)        S3_ENABLED="yes"; save_config; BASE_URL="$(effective_base_url)"; echo "Upload enabled.  Base-url: $BASE_URL" ;;
-    disable)       S3_ENABLED="no";  save_config; BASE_URL="$(effective_base_url)"; echo "Upload disabled. Base-url: $BASE_URL" ;;
-    -h|--help|"")  echo "usage: ijsi s3 [status|login|setup|sync|test|enable|disable]" ;;
+    -h|--help|"")  echo "usage: ijsi s3 [status|login|setup|sync|test]" ;;
     *)             echo "s3: unknown subcommand: $1" >&2
-                   echo "usage: ijsi s3 [status|login|setup|sync|test|enable|disable]" >&2; return 1 ;;
+                   echo "usage: ijsi s3 [status|login|setup|sync|test]" >&2; return 1 ;;
   esac
 }
 
@@ -698,11 +798,15 @@ cmd_s3() {
 # Runs "$@" while holding a non-blocking refresh lock. Returns 100 if busy.
 with_refresh_lock() {
   ensure_dirs
+  # Without flock we cannot serialise; run anyway rather than falsely report "busy".
+  if ! command -v flock >/dev/null 2>&1; then
+    echo "Note: flock not found - running without a concurrency lock." >&2
+    "$@"; return $?
+  fi
   local lockfd
   exec {lockfd}>"$CACHE_DIR/refresh.lock" || return 1
   if ! flock -n "$lockfd"; then
-    exec {lockfd}>&-
-    return 100
+    exec {lockfd}>&-; return 100
   fi
   "$@"
   local rc=$?
@@ -712,30 +816,29 @@ with_refresh_lock() {
 }
 
 # ---------------------------------------------------------------------------
-# CLI commands
+# refresh
 # ---------------------------------------------------------------------------
 
 do_refresh_cli() {
-  local force="$1" only="$2"
-  local n_idx=0 n_up=0 n_skip=0 n_fail=0 total=0
-  local project
-  local IJSI_FORCE="$force"   # visible to index_project via bash dynamic scope
+  local force="$1" only="$2" no_upload="$3"
+  local n_idx=0 n_up=0 n_skip=0 n_fail=0 total=0 repo
+  local IJSI_FORCE="$force"   # visible to index_repo via bash dynamic scope
 
-  while IFS= read -r project; do
-    [[ -z "$project" ]] && continue
-    if [[ -n "$only" ]] && ! match_only "$project" "$only"; then continue; fi
+  while IFS= read -r repo; do
+    [[ -z "$repo" ]] && continue
+    if [[ -n "$only" ]] && ! match_only "$repo" "$only"; then continue; fi
     total=$((total + 1))
-    index_project "$project"
+    index_repo "$repo"
     case $? in
       3) n_idx=$((n_idx + 1)) ;;
       0) n_up=$((n_up + 1)) ;;
       4) n_skip=$((n_skip + 1)) ;;
       *) n_fail=$((n_fail + 1)) ;;
     esac
-  done < <(iter_projects)
+  done < <(iter_repos)
 
   local upload_note=""
-  if [[ "$S3_ENABLED" == "yes" ]] && { [[ $n_idx -gt 0 ]] || [[ -f "$STATE_DIR/.needs_upload" ]]; }; then
+  if [[ -z "$no_upload" ]] && { [[ $n_idx -gt 0 ]] || [[ -f "$STATE_DIR/.needs_upload" ]]; }; then
     echo
     if s3_publish; then
       upload_note="ok"; rm -f "$STATE_DIR/.needs_upload"
@@ -752,13 +855,14 @@ do_refresh_cli() {
 }
 
 cmd_refresh() {
-  local force="" only=""
+  local force="" only="" no_upload=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -f|--force)   force="1" ;;
       --only)       shift; only="${1:-}" ;;
       --only=*)     only="${1#*=}" ;;
-      -h|--help)    echo "usage: ijsi refresh [--force] [--only name,name,...]"; return 0 ;;
+      --no-upload)  no_upload="1" ;;
+      -h|--help)    echo "usage: ijsi refresh [--force] [--only name,name,...] [--no-upload]"; return 0 ;;
       *)            echo "refresh: unknown argument: $1" >&2; return 1 ;;
     esac
     shift
@@ -769,82 +873,32 @@ cmd_refresh() {
     echo "Install ij-shared-indexes-tool-cli and ensure it is on PATH (or set IJSI_CLI)." >&2
     return 1
   fi
-
-  if [[ "$S3_ENABLED" == "yes" ]]; then
+  if ! have_composer; then
+    echo "Missing composer: $COMPOSER" >&2
+    echo "Install Composer and ensure it is on PATH (or set IJSI_COMPOSER)." >&2
+    return 1
+  fi
+  if [[ -z "$no_upload" ]]; then
     local probs line
     if ! probs="$(s3_preflight)"; then
-      echo "MinIO upload is enabled but not ready:" >&2
+      echo "MinIO upload is not ready:" >&2
       while IFS= read -r line; do echo "  - $line" >&2; done <<< "$probs"
-      echo "Fix it in the TUI (MinIO settings) or run: ijsi s3 setup" >&2
+      echo "Fix it in the TUI (MinIO settings), run: ijsi s3 setup, or use --no-upload to index only." >&2
       return 1
     fi
   fi
 
-  with_refresh_lock do_refresh_cli "$force" "$only"
+  with_refresh_lock do_refresh_cli "$force" "$only" "$no_upload"
   local rc=$?
   if [[ $rc -eq 100 ]]; then
-    echo "Another ijsi refresh is already running. Skipping." >&2
-    return 0
+    echo "Another ijsi refresh is already running. Skipping." >&2; return 0
   fi
   return $rc
 }
 
-cmd_server() {
-  ensure_dirs
-  if ! have_cli; then
-    echo "Missing CLI: $CLI" >&2
-    echo "Set IJSI_CLI to the absolute path of ij-shared-indexes-tool-cli" >&2
-    echo "(a bare name will not resolve under the systemd --user PATH)." >&2
-    return 1
-  fi
-  exec "$CLI" server --port "$PORT" --server-directory "$DATA_DIR/server"
-}
-
-# Doc "boost": measure project-analysis time with vs. without shared indexes.
-cmd_boost() {
-  local target="${1:-}"
-  if [[ -z "$target" ]]; then
-    echo "usage: ijsi boost <project-name-or-path>" >&2
-    echo "Measures project-analysis time with vs. without shared indexes." >&2
-    return 1
-  fi
-  if ! have_cli; then echo "Missing CLI: $CLI" >&2; return 1; fi
-
-  local project kind ide
-  project="$(resolve_project_arg "$target")" || { echo "No matching project for: $target" >&2; return 1; }
-  kind="$(project_kind "$project")"
-  ide="$(ide_for_kind "$kind")"
-  if [[ -z "$ide" || ! -e "$ide/product-info.json" ]]; then
-    echo "No usable $kind IDE found for $project (set the IDE path in: ijsi config)." >&2
-    return 1
-  fi
-
-  ensure_dirs
-  echo "Boost: measuring shared-index speedup for $project  [$kind]"
-  echo "This analyzes the project with and without shared indexes; it can take a while..."
-  run_low_priority "$CLI" boost \
-    --ij "$ide" \
-    --project "$project" \
-    --port "$PORT" \
-    --data-directory "$DATA_DIR"
-}
-
-# Doc "version": the CLI reports the shared-index version for an IDE (--ij).
-cmd_version() {
-  echo "ijsi $IJSI_VERSION"
-  if ! have_cli; then
-    echo "(ij-shared-indexes-tool-cli not found: $CLI)"
-    return 0
-  fi
-  local ide="${PHPSTORM_HOME:-${WEBSTORM_HOME:-${GOLAND_HOME:-${DATAGRIP_HOME:-}}}}"
-  if [[ -n "$ide" && -e "$ide/product-info.json" ]]; then
-    echo
-    echo "ij-shared-indexes-tool-cli version (--ij $ide):"
-    "$CLI" version --ij "$ide" 2>&1 | sed 's/^/  /'
-  else
-    echo "(point ijsi at an installed IDE to query the CLI shared-index version)"
-  fi
-}
+# ---------------------------------------------------------------------------
+# Status / config / maintenance
+# ---------------------------------------------------------------------------
 
 cmd_check() {
   printf '%sijsi%s %s\n\n' "$C_BOLD" "$C_RESET" "$IJSI_VERSION"
@@ -852,72 +906,70 @@ cmd_check() {
   printf 'Config file:\n  %s%s\n\n' "$CONFIG_FILE" \
     "$([[ -f "$CONFIG_FILE" ]] && echo "" || echo "  (not created yet)")"
 
-  printf 'Indexer CLI:\n  %s\n\n' "$(have_cli && command -v "$CLI" || echo "not found: $CLI")"
+  printf 'Tools:\n'
+  printf '  indexer CLI:  %s\n' "$(have_cli && command -v "$CLI" || echo "not found: $CLI")"
+  printf '  composer:     %s\n' "$(have_composer && command -v "$COMPOSER" || echo "not found: $COMPOSER")"
+  printf '  gh (for PRs): %s\n' "$(have_gh && command -v gh || echo "not found (intellij.yaml PRs disabled)")"
+  printf '  flock:        %s\n' "$(command -v flock 2>/dev/null || echo "not found (refresh runs without a lock)")"
+  printf '  terminal GUI: %s\n\n' "$(detect_tui_name)"
 
-  printf 'Terminal GUI:\n  %s\n\n' "$(detect_tui_name)"
+  printf 'PhpStorm:\n  %s\n\n' "${PHPSTORM_HOME:-not found (set PHPSTORM_IDE)}"
 
-  printf 'Detected IDE homes:\n'
-  printf '  PhpStorm: %s\n' "${PHPSTORM_HOME:-not found}"
-  printf '  WebStorm: %s\n' "${WEBSTORM_HOME:-not found}"
-  printf '  DataGrip: %s\n' "${DATAGRIP_HOME:-not found}"
-  printf '  GoLand:   %s\n\n' "${GOLAND_HOME:-not found}"
+  printf 'Repositories:\n'
+  if [[ -d "$REPOS_DIR" ]]; then printf '  folder:  %s  (found)\n' "$REPOS_DIR"; else printf '  folder:  %s  (MISSING)\n' "$REPOS_DIR"; fi
+  printf '  repos discovered: %s\n' "$(count_repos)"
+  printf '  branch tracked:   %s\n' "${DEFAULT_BRANCH:-auto (origin/HEAD)}"
+  printf '  intellij.yaml:    %s\n\n' "$INTELLIJ_YAML_VCS"
 
-  printf 'Project roots:\n'
-  local root
-  for root in "${PROJECT_ROOTS[@]}"; do
-    if [[ -d "$root" ]]; then printf '  found:   %s\n' "$root"; else printf '  missing: %s\n' "$root"; fi
-  done
-  printf '  projects discovered: %s\n\n' "$(count_projects)"
-
-  printf 'Hosting:\n'
-  printf '  upload (MinIO):     %s\n' "$S3_ENABLED"
-  printf '  effective base-url: %s\n' "$(effective_base_url)"
-  if [[ "$S3_ENABLED" == "yes" ]]; then
-    printf '  mc client:          %s\n' "$(have_mc && command -v "$MC" || echo "NOT FOUND: $MC")"
-    printf '  mc alias %-10s %s\n' "$S3_ALIAS:" "$(mc_alias_label)"
-    printf '  upload target:      %s\n' "$(s3_target)"
-    s3_preflight >/dev/null && printf '  readiness:          READY\n' || printf '  readiness:          NOT READY (see: ijsi s3 status)\n'
-  fi
+  printf 'Hosting (MinIO):\n'
+  printf '  public base-url:  %s\n' "$(s3_public_base_url)"
+  printf '  mc client:        %s\n' "$(have_mc && command -v "$MC" || echo "NOT FOUND: $MC")"
+  printf '  mc alias %-9s %s\n' "$S3_ALIAS:" "$(mc_alias_label)"
+  printf '  upload target:    %s\n' "$(s3_target)"
+  s3_preflight >/dev/null && printf '  readiness:        READY\n' || printf '  readiness:        NOT READY (see: ijsi s3 status)\n'
   printf '\n'
 
-  printf 'Cache:                %s\n' "$CACHE_DIR"
-  printf 'Local test server:    %s (systemd user service)\n' "$(server_state)"
+  printf 'Cache:  %s\n' "$CACHE_DIR"
 }
 
 cmd_list() {
-  iter_projects | while read -r project; do
-    local kind ide
-    kind="$(project_kind "$project")"
-    ide="$(ide_for_kind "$kind")"
-    printf '%-9s %-70s %s\n' "$kind" "$project" "${ide:-IDE not found}"
+  iter_repos | while read -r repo; do
+    local head
+    head="$(git -C "$repo" rev-parse --short HEAD 2>/dev/null || echo "-------")"
+    printf '%-40s %-16s %s\n' "$(basename "$repo")" "$(repo_default_branch "$repo")@$head" "$repo"
   done
+}
+
+cmd_logs() {
+  local f
+  f="$(ls -1t "$LOG_DIR"/*.log 2>/dev/null | head -1)"
+  if [[ -z "$f" ]]; then echo "No logs in $LOG_DIR yet. Run: ijsi refresh"; return 0; fi
+  echo "Newest log: $f"
+  echo "----------------------------------------"
+  cat "$f"
 }
 
 cmd_reset_state() {
   local target="${1:-}"
   if [[ -z "$target" ]]; then
     rm -f "$STATE_DIR"/*.sha256 2>/dev/null
-    echo "State reset. Next refresh will recheck all projects."
-    return 0
+    echo "State reset. Next refresh will recheck all repos."; return 0
   fi
-
-  local project kind name project_id
-  project="$(resolve_project_arg "$target")" || { echo "No matching project for: $target" >&2; return 1; }
-  kind="$(project_kind "$project")"
-  name="$(basename "$project")"
-  project_id="$(sanitize_id "${kind}-${name}")"
-  rm -f "$STATE_DIR/${project_id}.sha256"
-  echo "State reset for: $project  (next refresh will re-index it)."
+  local repo repo_id
+  repo="$(resolve_repo_arg "$target")" || { echo "No matching repo for: $target" >&2; return 1; }
+  repo_id="$(repo_id_for "$repo")"
+  rm -f "$STATE_DIR/${repo_id}.sha256"
+  echo "State reset for: $repo  (next refresh will re-index it)."
 }
 
 cmd_clear_cache() {
-  rm -rf "$CACHE_DIR"
-  ensure_dirs
+  rm -rf "$CACHE_DIR"; ensure_dirs
   echo "Cache cleared: $CACHE_DIR"
 }
 
 cmd_prune_logs() {
   local keep="${1:-100}" removed
+  if ! [[ "$keep" =~ ^[0-9]+$ ]]; then echo "prune-logs: keep must be a non-negative integer" >&2; return 1; fi
   removed="$(ls -1t "$LOG_DIR"/*.log 2>/dev/null | tail -n +"$((keep + 1))" | wc -l | tr -d ' ')"
   ls -1t "$LOG_DIR"/*.log 2>/dev/null | tail -n +"$((keep + 1))" | xargs -r rm -f
   echo "Pruned ${removed:-0} old log file(s); kept newest $keep."
@@ -935,97 +987,26 @@ cmd_config() {
 }
 
 print_resolved_config() {
-  printf 'config file:       %s\n' "$CONFIG_FILE"
-  printf 'PORT:              %s\n' "$PORT"
-  printf 'CACHE_DIR:         %s\n' "$CACHE_DIR"
-  printf 'CLI:               %s\n' "$CLI"
-  printf 'MC:                %s\n' "$MC"
-  printf 'TOOLBOX_APPS:      %s\n' "$TOOLBOX_APPS"
-  printf 'S3_ENABLED:        %s\n' "$S3_ENABLED"
-  printf 'S3_ALIAS:          %s  (%s)\n' "$S3_ALIAS" "$(mc_alias_label)"
-  printf 'S3_ENDPOINT:       %s\n' "${S3_ENDPOINT:-<unset>}"
-  printf 'S3_BUCKET:         %s\n' "${S3_BUCKET:-<unset>}"
-  printf 'S3_PREFIX:         %s\n' "${S3_PREFIX:-<none>}"
-  printf 'PUBLIC_BASE_URL:   %s\n' "${PUBLIC_BASE_URL:-<auto>}"
-  printf 'effective base:    %s\n' "$(effective_base_url)"
-  printf 'PHPSTORM_IDE:      %s  ->  %s\n' "$PHPSTORM_IDE" "${PHPSTORM_HOME:-<none>}"
-  printf 'WEBSTORM_IDE:      %s  ->  %s\n' "$WEBSTORM_IDE" "${WEBSTORM_HOME:-<none>}"
-  printf 'DATAGRIP_IDE:      %s  ->  %s\n' "$DATAGRIP_IDE" "${DATAGRIP_HOME:-<none>}"
-  printf 'GOLAND_IDE:        %s  ->  %s\n' "$GOLAND_IDE" "${GOLAND_HOME:-<none>}"
-  printf 'PROJECT_ROOTS:     %s\n' "${PROJECT_ROOTS[*]}"
-}
-
-# ---------------------------------------------------------------------------
-# systemd (user) - optional local test server only (no refresh timer)
-# ---------------------------------------------------------------------------
-
-server_state() { local s; s="$(systemctl --user is-active ij-shared-indexes-server.service 2>/dev/null)"; printf '%s' "${s:-unknown}"; }
-
-cmd_install_systemd() {
-  mkdir -p "$SYSTEMD_DIR"
-
-  # Bake an absolute CLI path and the config path into the unit: systemd --user
-  # services run with a stripped PATH, so the bare CLI name would not resolve.
-  local cli_abs
-  cli_abs="$(command -v "$CLI" 2>/dev/null || printf '%s' "$CLI")"
-
-  cat > "$SYSTEMD_DIR/ij-shared-indexes-server.service" <<EOF
-[Unit]
-Description=JetBrains Shared Indexes Local Test Server
-After=default.target
-StartLimitIntervalSec=60
-StartLimitBurst=3
-
-[Service]
-Type=simple
-Environment=IJSI_CLI=$cli_abs
-Environment=IJSI_CONFIG=$CONFIG_FILE
-ExecStart=$SELF server
-Restart=on-failure
-RestartSec=10
-
-[Install]
-WantedBy=default.target
-EOF
-
-  systemctl --user daemon-reload
-  systemctl --user enable --now ij-shared-indexes-server.service
-  echo "Installed and enabled the local test-server service."
-  echo "(With MinIO upload enabled you usually don't need this - indexes are hosted on the bucket.)"
-}
-
-cmd_uninstall_systemd() {
-  systemctl --user disable --now ij-shared-indexes-server.service 2>/dev/null || true
-  # Also remove legacy refresh units from older ijsi versions, if present.
-  systemctl --user disable --now ij-shared-indexes-refresh.timer 2>/dev/null || true
-  rm -f "$SYSTEMD_DIR/ij-shared-indexes-server.service" \
-        "$SYSTEMD_DIR/ij-shared-indexes-refresh.service" \
-        "$SYSTEMD_DIR/ij-shared-indexes-refresh.timer"
-  systemctl --user daemon-reload
-  echo "Removed ijsi systemd user services."
-}
-
-cmd_status() {
-  systemctl --user status ij-shared-indexes-server.service --no-pager 2>&1
-}
-
-cmd_server_logs() { journalctl --user -u ij-shared-indexes-server.service -f; }
-
-# Show the newest run log (no systemd journal involved any more).
-cmd_logs() {
-  local f
-  f="$(ls -1t "$LOG_DIR"/*.log 2>/dev/null | head -1)"
-  if [[ -z "$f" ]]; then
-    echo "No logs in $LOG_DIR yet. Run: ijsi refresh"
-    return 0
-  fi
-  echo "Newest log: $f"
-  echo "----------------------------------------"
-  cat "$f"
+  printf 'config file:        %s\n' "$CONFIG_FILE"
+  printf 'REPOS_DIR:          %s\n' "$REPOS_DIR"
+  printf 'CACHE_DIR:          %s\n' "$CACHE_DIR"
+  printf 'CLI:                %s\n' "$CLI"
+  printf 'MC:                 %s\n' "$MC"
+  printf 'COMPOSER:           %s\n' "$COMPOSER"
+  printf 'TOOLBOX_APPS:       %s\n' "$TOOLBOX_APPS"
+  printf 'PHPSTORM_IDE:       %s  ->  %s\n' "$PHPSTORM_IDE" "${PHPSTORM_HOME:-<none>}"
+  printf 'DEFAULT_BRANCH:     %s\n' "${DEFAULT_BRANCH:-<auto>}"
+  printf 'INTELLIJ_YAML_VCS:  %s\n' "$INTELLIJ_YAML_VCS"
+  printf 'S3_ALIAS:           %s  (%s)\n' "$S3_ALIAS" "$(mc_alias_label)"
+  printf 'S3_ENDPOINT:        %s\n' "${S3_ENDPOINT:-<unset>}"
+  printf 'S3_BUCKET:          %s\n' "${S3_BUCKET:-<unset>}"
+  printf 'S3_PREFIX:          %s\n' "${S3_PREFIX:-<none>}"
+  printf 'PUBLIC_BASE_URL:    %s\n' "${PUBLIC_BASE_URL:-<auto>}"
+  printf 'public base-url:    %s\n' "$(s3_public_base_url)"
 }
 
 # ===========================================================================
-# Terminal GUI (whiptail / dialog)
+# Terminal GUI (whiptail / dialog) - slimmed
 # ===========================================================================
 
 TUI=""
@@ -1041,437 +1022,185 @@ detect_tui_name() {
 
 # whiptail/dialog wrappers. Both write the chosen value to stderr; the
 # 3>&1 1>&2 2>&3 dance moves it to stdout so we can capture it.
-tui_menu()      { local t="$1" x="$2"; shift 2; "$TUI" --title "$t" --menu      "$x" 21 78 12 "$@" 3>&1 1>&2 2>&3; }
-tui_checklist() { local t="$1" x="$2"; shift 2; "$TUI" --separate-output --title "$t" --checklist "$x" 22 90 14 "$@" 3>&1 1>&2 2>&3; }
-tui_input()     { local t="$1" x="$2" d="$3";   "$TUI" --title "$t" --inputbox  "$x" 10 78 "$d" 3>&1 1>&2 2>&3; }
-tui_password()  { local t="$1" x="$2";          "$TUI" --title "$t" --passwordbox "$x" 10 78 3>&1 1>&2 2>&3; }
-tui_yesno()     { local t="$1" x="$2";          "$TUI" --title "$t" --yesno     "$x" 12 78; }
-tui_msg()       { local t="$1" x="$2";          "$TUI" --title "$t" --msgbox    "$x" 18 80; }
-tui_textbox()   { local t="$1" f="$2";          "$TUI" --title "$t" --textbox   "$f" 26 100; }
-tui_gauge()     { local t="$1";                 "$TUI" --title "$t" --gauge "Starting..." 8 74 0; }
+tui_menu()     { local t="$1" x="$2"; shift 2; "$TUI" --title "$t" --menu       "$x" 21 86 12 "$@" 3>&1 1>&2 2>&3; }
+tui_input()    { local t="$1" x="$2" d="$3";   "$TUI" --title "$t" --inputbox    "$x" 10 86 "$d" 3>&1 1>&2 2>&3; }
+tui_password() { local t="$1" x="$2";          "$TUI" --title "$t" --passwordbox "$x" 10 86 3>&1 1>&2 2>&3; }
+tui_yesno()    { local t="$1" x="$2";          "$TUI" --title "$t" --yesno       "$x" 12 86; }
+tui_msg()      { local t="$1" x="$2";          "$TUI" --title "$t" --msgbox       "$x" 18 86; }
+tui_textbox()  { local t="$1" f="$2";          "$TUI" --title "$t" --textbox      "$f" 26 100; }
+
+# Run a refresh (optionally forced / filtered) and show the result in a textbox.
+tui_run_refresh() {
+  local force="$1" only="$2"
+  local out; out="$(mktemp "${TMPDIR:-/tmp}/ijsi.XXXXXX")"
+  clear
+  echo "Running refresh: update -> composer install -> index -> upload ..."
+  echo
+  # No colours into the captured file.
+  (
+    C_RESET= ; C_BOLD= ; C_DIM= ; C_GREEN= ; C_YELLOW= ; C_RED= ; C_BLUE=
+    cmd_refresh ${force:+--force} ${only:+--only "$only"}
+  ) 2>&1 | tee "$out"
+  tui_textbox "Refresh result" "$out"
+  rm -f "$out"
+}
+
+tui_minio_menu() {
+  local choice v out
+  while true; do
+    choice="$(tui_menu "MinIO / S3" "Alias: $(mc_alias_label)   Bucket: ${S3_BUCKET:-<unset>}   URL: $(s3_public_base_url)" \
+      login    "Set credentials (endpoint + keys)" \
+      setup    "Create bucket + grant public download" \
+      test     "Test the connection" \
+      endpoint "Set endpoint URL" \
+      bucket   "Set bucket name" \
+      prefix   "Set prefix (optional)" \
+      url      "Set public base URL override (optional)" \
+      status   "Show MinIO status" \
+      back     "Back")" || return
+    case "$choice" in
+      login)    clear; cmd_s3_login; echo; read -r -p "Press Enter..." _ ;;
+      setup)    clear; cmd_s3_setup; echo; read -r -p "Press Enter..." _ ;;
+      test)     clear; cmd_s3_test;  echo; read -r -p "Press Enter..." _ ;;
+      endpoint) v="$(tui_input "Endpoint" "S3 endpoint URL:" "$S3_ENDPOINT")" && { S3_ENDPOINT="$v"; save_config; BASE_URL="$(s3_public_base_url)"; } ;;
+      bucket)   v="$(tui_input "Bucket" "Bucket name:" "$S3_BUCKET")" && { S3_BUCKET="$v"; save_config; BASE_URL="$(s3_public_base_url)"; } ;;
+      prefix)   v="$(tui_input "Prefix" "Object key prefix (blank = none):" "$S3_PREFIX")" && { S3_PREFIX="$v"; save_config; BASE_URL="$(s3_public_base_url)"; } ;;
+      url)      v="$(tui_input "Public URL" "Override public base URL (blank = derive):" "$PUBLIC_BASE_URL")" && { PUBLIC_BASE_URL="$v"; save_config; BASE_URL="$(s3_public_base_url)"; } ;;
+      status)   out="$(mktemp "${TMPDIR:-/tmp}/ijsi.XXXXXX")"; s3_status > "$out" 2>&1; tui_textbox "MinIO status" "$out"; rm -f "$out" ;;
+      back|*)   return ;;
+    esac
+  done
+}
+
+tui_config_menu() {
+  local choice v out
+  while true; do
+    choice="$(tui_menu "Configure" "Repos: $REPOS_DIR   PhpStorm: ${PHPSTORM_HOME:-<none>}" \
+      repos    "Repos folder              ($REPOS_DIR)" \
+      phpstorm "PhpStorm install dir      ($PHPSTORM_IDE)" \
+      branch   "Branch to track           (${DEFAULT_BRANCH:-auto})" \
+      yaml     "intellij.yaml VCS mode    ($INTELLIJ_YAML_VCS)" \
+      cli      "Indexer CLI               ($CLI)" \
+      composer "Composer command          ($COMPOSER)" \
+      mc       "mc command                ($MC)" \
+      show     "Show resolved config" \
+      back     "Back")" || return
+    case "$choice" in
+      repos)    v="$(tui_input "Repos folder" "Folder containing your forked API repos:" "$REPOS_DIR")" && { REPOS_DIR="$v"; save_config; } ;;
+      phpstorm) v="$(tui_input "PhpStorm" "Install dir, or 'auto' to detect:" "$PHPSTORM_IDE")" && { PHPSTORM_IDE="$v"; save_config; PHPSTORM_HOME="$(resolve_phpstorm "$PHPSTORM_IDE")"; } ;;
+      branch)   v="$(tui_input "Branch" "Branch to track (blank = auto-detect):" "$DEFAULT_BRANCH")" && { DEFAULT_BRANCH="$v"; save_config; } ;;
+      yaml)     v="$(tui_menu "intellij.yaml VCS" "How should ijsi land intellij.yaml?" pr "Open a PR per repo" leave "Write only (you commit)" off "Do not touch git")" && { INTELLIJ_YAML_VCS="$v"; save_config; } ;;
+      cli)      v="$(tui_input "Indexer CLI" "ij-shared-indexes-tool-cli command or path:" "$CLI")" && { CLI="$v"; save_config; } ;;
+      composer) v="$(tui_input "Composer" "composer command or path:" "$COMPOSER")" && { COMPOSER="$v"; save_config; } ;;
+      mc)       v="$(tui_input "mc" "MinIO client command or path:" "$MC")" && { MC="$v"; save_config; } ;;
+      show)     out="$(mktemp "${TMPDIR:-/tmp}/ijsi.XXXXXX")"; print_resolved_config > "$out"; tui_textbox "Resolved config" "$out"; rm -f "$out" ;;
+      back|*)   return ;;
+    esac
+  done
+}
+
+tui_maint_menu() {
+  local choice out
+  while true; do
+    choice="$(tui_menu "Maintenance" "Cache: $CACHE_DIR" \
+      reset "Reset state (recheck all repos next refresh)" \
+      sync  "Re-upload local indexes to MinIO" \
+      prune "Prune old logs (keep newest 100)" \
+      clear "Clear the entire cache" \
+      back  "Back")" || return
+    case "$choice" in
+      reset) tui_yesno "Reset state" "Forget all index fingerprints?\nNext refresh re-checks every repo." && { cmd_reset_state >/dev/null; tui_msg "Done" "State reset."; } ;;
+      sync)  out="$(mktemp "${TMPDIR:-/tmp}/ijsi.XXXXXX")"; s3_publish > "$out" 2>&1 && rm -f "$STATE_DIR/.needs_upload"; tui_textbox "Re-upload to MinIO" "$out"; rm -f "$out" ;;
+      prune) out="$(mktemp "${TMPDIR:-/tmp}/ijsi.XXXXXX")"; cmd_prune_logs 100 > "$out" 2>&1; tui_textbox "Prune logs" "$out"; rm -f "$out" ;;
+      clear) tui_yesno "Clear cache" "Delete $CACHE_DIR entirely?\nAll generated indexes and state are removed." && { cmd_clear_cache >/dev/null; tui_msg "Done" "Cache cleared."; } ;;
+      back|*) return ;;
+    esac
+  done
+}
 
 tui_main() {
   detect_tui
   if [[ -z "$TUI" ]]; then
     echo "The terminal GUI needs 'whiptail' (package: newt) or 'dialog'." >&2
-    echo "Install one, e.g.:  sudo apt install whiptail   (or: sudo pacman -S newt)" >&2
-    echo >&2
-    usage
-    return 1
+    echo "Install one, e.g.:  sudo pacman -S newt   (or: sudo apt install whiptail)" >&2
+    echo >&2; usage; return 1
   fi
 
   ensure_dirs
   save_config_if_missing
 
-  local choice header
+  local choice header v out
   while true; do
-    header="$(printf 'Local JetBrains shared-index manager (v%s)\n\nUpload: %s    mc alias: %s\nPublic URL: %s\nProjects: %s    Config: %s\n\nChoose an action:' \
-      "$IJSI_VERSION" "$(s3_state_label)" "$(mc_alias_label)" "$(s3_public_base_url)" "$(count_projects)" "$CONFIG_FILE")"
+    header="$(printf 'JetBrains shared-index manager for PHP API forks (v%s)\n\nRepos: %s in %s\nMinIO: %s    URL: %s\n\nChoose an action:' \
+      "$IJSI_VERSION" "$(count_repos)" "$REPOS_DIR" "$(mc_alias_label)" "$(s3_public_base_url)")"
 
     choice="$(tui_menu "ijsi" "$header" \
-      refresh "Refresh / index changed projects (+ upload)" \
-      select  "Pick specific projects to index" \
-      force   "Force re-index everything (ignore cache)" \
-      minio   "MinIO / S3 upload settings & credentials" \
-      boost   "Evaluate speedup on one project (boost)" \
-      config  "Configure IDEs, roots, port" \
-      server  "Local test server & systemd" \
+      refresh "Update + index changed repos, then upload" \
+      force   "Force re-index ALL repos (ignore cache)" \
+      only    "Index specific repos by name" \
+      minio   "MinIO / S3 settings & credentials" \
+      config  "Configure repos folder, PhpStorm, paths" \
       status  "Status & health check" \
-      logs    "View logs" \
-      maint   "Maintenance (reset / prune / clear / re-sync)" \
+      logs    "View newest log" \
+      maint   "Maintenance (reset / prune / clear)" \
       quit    "Quit")" || break
 
     case "$choice" in
-      refresh) tui_run_refresh "" "$(iter_projects)" ;;
-      select)  tui_select_refresh ;;
-      force)   tui_yesno "Force re-index" "Re-index ALL projects, ignoring the cache?\nThis can take a while." \
-                 && tui_run_refresh "1" "$(iter_projects)" ;;
+      refresh) tui_run_refresh "" "" ;;
+      force)   tui_yesno "Force re-index" "Re-index ALL repos, ignoring the cache?\nThis can take a while." && tui_run_refresh "1" "" ;;
+      only)    v="$(tui_input "Index specific repos" "Comma-separated repo names:" "")" && [[ -n "$v" ]] && tui_run_refresh "" "$v" ;;
       minio)   tui_minio_menu ;;
-      boost)   tui_boost ;;
       config)  tui_config_menu ;;
-      server)  tui_server_menu ;;
-      status)  tui_show_status ;;
-      logs)    tui_logs_menu ;;
+      status)  out="$(mktemp "${TMPDIR:-/tmp}/ijsi.XXXXXX")"; cmd_check > "$out" 2>&1; tui_textbox "Status" "$out"; rm -f "$out" ;;
+      logs)    out="$(mktemp "${TMPDIR:-/tmp}/ijsi.XXXXXX")"; cmd_logs > "$out" 2>&1; tui_textbox "Newest log" "$out"; rm -f "$out" ;;
       maint)   tui_maint_menu ;;
-      quit|"") break ;;
+      quit|*)  break ;;
     esac
   done
   clear 2>/dev/null || true
 }
 
-# Drives index_project across a newline-separated project list, showing a gauge,
-# then uploads to MinIO (if enabled and anything was indexed).
-tui_run_refresh() {
-  local force="$1" project_list="$2"
-  local -a projects=()
-  local p
-  while IFS= read -r p; do [[ -n "$p" ]] && projects+=( "$p" ); done <<< "$project_list"
-
-  local total=${#projects[@]}
-  if [[ $total -eq 0 ]]; then tui_msg "Refresh" "No projects to index."; return; fi
-
-  if ! have_cli; then
-    tui_msg "Refresh" "Missing CLI: $CLI\n\nInstall ij-shared-indexes-tool-cli and ensure it is on PATH, or set IJSI_CLI in the config."
-    return
-  fi
-
-  if [[ "$S3_ENABLED" == "yes" ]]; then
-    local probs
-    if ! probs="$(s3_preflight)"; then
-      tui_msg "Refresh" "MinIO upload is ON but not ready:\n\n$probs\n\nConfigure it under 'MinIO / S3 upload settings', or disable upload."
-      return
-    fi
-  fi
-
-  ensure_dirs
-  local lockfd
-  exec {lockfd}>"$CACHE_DIR/refresh.lock" || { tui_msg "Refresh" "Cannot open lock file."; return; }
-  if ! flock -n "$lockfd"; then
-    exec {lockfd}>&-
-    tui_msg "Refresh" "Another refresh is already running (another window)."
-    return
-  fi
-
-  local results runlog
-  results="$(mktemp)"
-  runlog="$LOG_DIR/refresh-$(date +%Y%m%d-%H%M%S).log"
-
-  {
-    local i=0 name pct
-    local IJSI_RESULTS="$results"
-    local IJSI_FORCE="$force"
-    for p in "${projects[@]}"; do
-      name="$(basename "$p")"
-      pct=$(( i * 100 / total ))
-      printf 'XXX\n%d\nIndexing %s   (%d of %d)\nXXX\n' "$pct" "$name" "$((i + 1))" "$total"
-      index_project "$p" >> "$runlog" 2>&1
-      i=$((i + 1))
-    done
-    printf 'XXX\n100\nFinished.\nXXX\n'
-  } | tui_gauge "Refreshing shared indexes"
-
-  flock -u "$lockfd"
-  exec {lockfd}>&-
-
-  local n_idx n_up n_skip n_fail
-  n_idx=$(grep -c '^indexed'  "$results" 2>/dev/null);  n_idx=${n_idx:-0}
-  n_up=$(grep  -c '^uptodate' "$results" 2>/dev/null);  n_up=${n_up:-0}
-  n_skip=$(grep -c '^skipped' "$results" 2>/dev/null);  n_skip=${n_skip:-0}
-  n_fail=$(grep -c '^failed'  "$results" 2>/dev/null);  n_fail=${n_fail:-0}
-  rm -f "$results"
-
-  local upload_line=""
-  if [[ "$S3_ENABLED" == "yes" ]] && { [[ "$n_idx" -gt 0 ]] || [[ -f "$STATE_DIR/.needs_upload" ]]; }; then
-    if s3_publish >> "$runlog" 2>&1; then
-      upload_line="$(printf '\nUploaded to: %s' "$(s3_public_base_url)")"
-      rm -f "$STATE_DIR/.needs_upload"
-    else
-      upload_line="$(printf '\nUPLOAD FAILED - see log')"
-    fi
-  fi
-
-  local summary
-  summary="$(printf 'Indexed:     %s\nUp to date:  %s\nSkipped:     %s\nFailed:      %s%s\n\nLog: %s' \
-    "$n_idx" "$n_up" "$n_skip" "$n_fail" "$upload_line" "$runlog")"
-  tui_msg "Refresh complete" "$summary"
-
-  if [[ "$n_fail" -gt 0 ]] && tui_yesno "Refresh" "Some projects failed. View the log now?"; then
-    tui_textbox "Refresh log" "$runlog"
-  fi
-}
-
-tui_select_refresh() {
-  local -a plist=() items=()
-  local p k
-  while IFS= read -r p; do [[ -n "$p" ]] && plist+=( "$p" ); done < <(iter_projects)
-
-  if [[ ${#plist[@]} -eq 0 ]]; then tui_msg "Select projects" "No projects found."; return; fi
-
-  for p in "${plist[@]}"; do
-    k="$(project_kind "$p")"
-    items+=( "$p" "[$k] $(basename "$p")" "off" )
-  done
-
-  local chosen
-  # --separate-output (set in tui_checklist) makes whiptail print the chosen tags
-  # one per line, unquoted, so we pass them straight through instead of eval-parsing
-  # its output (which would execute metacharacters in project paths).
-  chosen="$(tui_checklist "Select projects" "Space toggles, Enter confirms. Selected projects will be indexed." "${items[@]}")" || return
-  [[ -z "$chosen" ]] && { tui_msg "Select projects" "Nothing selected."; return; }
-
-  tui_run_refresh "" "$chosen"
-}
-
-tui_boost() {
-  local -a plist=() items=()
-  local p k proj
-  while IFS= read -r p; do [[ -n "$p" ]] && plist+=( "$p" ); done < <(iter_projects)
-  if [[ ${#plist[@]} -eq 0 ]]; then tui_msg "Boost" "No projects found."; return; fi
-  for p in "${plist[@]}"; do k="$(project_kind "$p")"; items+=( "$p" "[$k] $(basename "$p")" ); done
-
-  proj="$(tui_menu "Boost - evaluate speedup" "Pick a project to measure the shared-index speedup (with vs. without):" "${items[@]}")" || return
-  [[ -z "$proj" ]] && return
-
-  clear 2>/dev/null || true
-  local out; out="$(mktemp)"
-  cmd_boost "$proj" 2>&1 | tee "$out"
-  echo; echo "Press Enter to return to the menu..."; read -r _ || true
-  tui_textbox "Boost result" "$out"
-  rm -f "$out"
-}
-
-tui_minio_menu() {
-  local choice
-  while true; do
-    choice="$(tui_menu "MinIO / S3 upload" \
-      "$(printf 'Endpoint: %s   Alias: %s (%s)\nBucket: %s   Prefix: %s\nPublic URL: %s\nUpload: %s' \
-          "${S3_ENDPOINT:-<unset>}" "$S3_ALIAS" "$(mc_alias_label)" \
-          "${S3_BUCKET:-<unset>}" "${S3_PREFIX:-<none>}" \
-          "$(s3_public_base_url)" "$(s3_state_label)")" \
-      creds   "Set credentials (endpoint / access / secret)" \
-      bucket  "Set bucket name              (${S3_BUCKET:-unset})" \
-      prefix  "Set path prefix              (${S3_PREFIX:-none})" \
-      url     "Override public base URL     (${PUBLIC_BASE_URL:-auto})" \
-      toggle  "Enable / disable upload      ($(s3_state_label))" \
-      setup   "Create bucket + make public (anonymous download)" \
-      test    "Test connection" \
-      sync    "Re-upload local indexes now" \
-      status  "Show resolved S3 status" \
-      back    "Back")" || return
-
-    case "$choice" in
-      creds)  tui_minio_creds ;;
-      bucket) local v; v="$(tui_input "Bucket" "S3 bucket name for shared indexes:" "$S3_BUCKET")" \
-                && { S3_BUCKET="$v"; BASE_URL="$(effective_base_url)"; save_config; } ;;
-      prefix) local v; v="$(tui_input "Prefix" "Optional path prefix inside the bucket (blank = none):" "$S3_PREFIX")" \
-                && { S3_PREFIX="$v"; BASE_URL="$(effective_base_url)"; save_config; } ;;
-      url)    local v; v="$(tui_input "Public base URL" "Override the public download URL the IDE uses.\nLeave blank to derive from endpoint + bucket + prefix:" "$PUBLIC_BASE_URL")" \
-                && { PUBLIC_BASE_URL="$v"; BASE_URL="$(effective_base_url)"; save_config; } ;;
-      toggle) if [[ "$S3_ENABLED" == "yes" ]]; then S3_ENABLED="no"; else S3_ENABLED="yes"; fi
-              BASE_URL="$(effective_base_url)"; save_config
-              tui_msg "Upload" "Upload is now: $(s3_state_label)\nBase-url: $BASE_URL" ;;
-      setup)  local t; t="$(mktemp)"; cmd_s3_setup >"$t" 2>&1; tui_textbox "Bucket setup" "$t"; rm -f "$t" ;;
-      test)   local t; t="$(mktemp)"; cmd_s3_test  >"$t" 2>&1; tui_textbox "Connection test" "$t"; rm -f "$t" ;;
-      sync)   local t; t="$(mktemp)"; s3_publish >"$t" 2>&1 && rm -f "$STATE_DIR/.needs_upload"; tui_textbox "Re-upload" "$t"; rm -f "$t" ;;
-      status) local t; t="$(mktemp)"; s3_status    >"$t" 2>&1; tui_textbox "S3 status" "$t"; rm -f "$t" ;;
-      back|"") return ;;
-    esac
-  done
-}
-
-tui_minio_creds() {
-  local endpoint access secret
-  endpoint="$(tui_input "MinIO endpoint" "S3 API endpoint URL (e.g. https://minio.example.com:9000):" "$S3_ENDPOINT")" || return
-  [[ -z "$endpoint" ]] && { tui_msg "Credentials" "Endpoint is required."; return; }
-  access="$(tui_input "Access key" "MinIO/S3 access key:" "")" || return
-  secret="$(tui_password "Secret key" "MinIO/S3 secret key (input hidden):")" || return
-  if [[ -z "$access" || -z "$secret" ]]; then tui_msg "Credentials" "Access key and secret key are both required."; return; fi
-  if ! have_mc; then
-    tui_msg "Credentials" "mc (MinIO Client) not found: $MC\n\nInstall it (or set MC in the config), then retry."
-    return
-  fi
-  if mc_set_alias "$endpoint" "$access" "$secret"; then
-    S3_ENDPOINT="$endpoint"; BASE_URL="$(effective_base_url)"; save_config
-    tui_msg "Credentials" "Saved to mc alias '$S3_ALIAS' (~/.mc/config.json).\n\nThe secret key is NOT stored in ijsi's config.\n\nNext: set a bucket, then 'Create bucket + make public'."
-  else
-    tui_msg "Credentials" "Failed to register the mc alias '$S3_ALIAS'.\nCheck the endpoint URL and keys, then retry."
-  fi
-}
-
-tui_config_menu() {
-  local choice
-  while true; do
-    choice="$(tui_menu "Configure" "Settings are saved to:\n$CONFIG_FILE\n\n(IJSI_* environment variables override the file.)" \
-      port     "Server port                ($PORT)" \
-      roots    "Project root folders       (${#PROJECT_ROOTS[@]})" \
-      ides     "IDE install locations" \
-      toolbox  "Toolbox apps folder" \
-      cli      "shared-indexes CLI         ($CLI)" \
-      mc       "mc (MinIO Client) command  ($MC)" \
-      view     "View resolved configuration" \
-      edit     "Open config file in \$EDITOR" \
-      back     "Back")" || return
-
-    case "$choice" in
-      port)     local v; v="$(tui_input "Server port" "TCP port for the local test server:" "$PORT")" \
-                  && [[ "$v" =~ ^[0-9]+$ ]] && { PORT="$v"; BASE_URL="$(effective_base_url)"; save_config; } ;;
-      roots)    tui_roots_menu ;;
-      ides)     tui_ides_menu ;;
-      toolbox)  local v; v="$(tui_input "Toolbox apps" "Folder containing JetBrains Toolbox app installs:" "$TOOLBOX_APPS")" \
-                  && [[ -n "$v" ]] && { TOOLBOX_APPS="$v"; apply_env_and_defaults; save_config; } ;;
-      cli)      local v; v="$(tui_input "CLI" "shared-indexes CLI command or path:" "$CLI")" \
-                  && [[ -n "$v" ]] && { CLI="$v"; save_config; } ;;
-      mc)       local v; v="$(tui_input "mc" "MinIO Client command or path:" "$MC")" \
-                  && [[ -n "$v" ]] && { MC="$v"; save_config; } ;;
-      view)     local t; t="$(mktemp)"; print_resolved_config > "$t"; tui_textbox "Resolved configuration" "$t"; rm -f "$t" ;;
-      edit)     save_config; clear 2>/dev/null || true; "${EDITOR:-vi}" "$CONFIG_FILE"; load_config; apply_env_and_defaults ;;
-      back|"")  return ;;
-    esac
-  done
-}
-
-tui_roots_menu() {
-  local choice
-  while true; do
-    local -a items=()
-    local r idx=0
-    for r in "${PROJECT_ROOTS[@]}"; do items+=( "$idx" "$r" ); idx=$((idx + 1)); done
-    items+=( "add" "+ Add a project root..." )
-    items+=( "back" "Back" )
-
-    choice="$(tui_menu "Project roots" "Select a root to remove, or add a new one:" "${items[@]}")" || return
-    case "$choice" in
-      add)  local v; v="$(tui_input "Add project root" "Path to a folder containing project directories:" "$HOME/")" \
-              && [[ -n "$v" ]] && { PROJECT_ROOTS+=( "$v" ); save_config; } ;;
-      back|"") return ;;
-      *)    if tui_yesno "Remove root" "Remove this project root?\n\n${PROJECT_ROOTS[$choice]}"; then
-              unset 'PROJECT_ROOTS[$choice]'
-              PROJECT_ROOTS=( "${PROJECT_ROOTS[@]}" )
-              save_config
-            fi ;;
-    esac
-  done
-}
-
-tui_ides_menu() {
-  local choice
-  while true; do
-    choice="$(tui_menu "IDE locations" "Set each IDE to 'auto' (detect from Toolbox) or an absolute install dir." \
-      phpstorm "PhpStorm   ($PHPSTORM_IDE)" \
-      webstorm "WebStorm   ($WEBSTORM_IDE)" \
-      datagrip "DataGrip   ($DATAGRIP_IDE)" \
-      goland   "GoLand     ($GOLAND_IDE)" \
-      back     "Back")" || return
-
-    local var cur
-    case "$choice" in
-      phpstorm) var=PHPSTORM_IDE; cur="$PHPSTORM_IDE" ;;
-      webstorm) var=WEBSTORM_IDE; cur="$WEBSTORM_IDE" ;;
-      datagrip) var=DATAGRIP_IDE; cur="$DATAGRIP_IDE" ;;
-      goland)   var=GOLAND_IDE;   cur="$GOLAND_IDE" ;;
-      back|"")  return ;;
-    esac
-
-    local v
-    v="$(tui_input "$choice" "'auto' to detect, or an absolute IDE install dir:" "$cur")" || continue
-    [[ -z "$v" ]] && continue
-    printf -v "$var" '%s' "$v"
-    apply_env_and_defaults
-    save_config
-  done
-}
-
-tui_server_menu() {
-  local choice
-  while true; do
-    choice="$(tui_menu "Local test server & systemd" \
-      "$(printf 'The local server hosts indexes at http://127.0.0.1:%s for testing\nwhen MinIO upload is off. Service state: %s' "$PORT" "$(server_state)")" \
-      install   "Install + enable the local server service" \
-      uninstall "Uninstall the server service" \
-      restart   "Restart the server service" \
-      back      "Back")" || return
-
-    case "$choice" in
-      install)   local t; t="$(mktemp)"; cmd_install_systemd > "$t" 2>&1; tui_textbox "Install" "$t"; rm -f "$t" ;;
-      uninstall) tui_yesno "Uninstall" "Remove the systemd user service(s)?" \
-                   && { local t; t="$(mktemp)"; cmd_uninstall_systemd > "$t" 2>&1; tui_textbox "Uninstall" "$t"; rm -f "$t"; } ;;
-      restart)   systemctl --user restart ij-shared-indexes-server.service 2>/dev/null; tui_msg "Server" "Restart requested.\nState: $(server_state)" ;;
-      back|"")   return ;;
-    esac
-  done
-}
-
-tui_show_status() {
-  local t; t="$(mktemp)"
-  { cmd_check; echo; echo "----- MinIO / S3 -----"; s3_status; echo; echo "----- systemd -----"; cmd_status; } > "$t" 2>&1
-  tui_textbox "Status & health" "$t"
-  rm -f "$t"
-}
-
-tui_logs_menu() {
-  local choice
-  while true; do
-    local -a items=()
-    local f n=0
-    while IFS= read -r f; do
-      [[ -z "$f" ]] && continue
-      items+=( "$f" "$(basename "$f")" )
-      n=$((n + 1))
-    done < <(ls -1t "$LOG_DIR"/*.log 2>/dev/null | head -n 25)
-
-    if [[ $n -eq 0 ]]; then tui_msg "Logs" "No logs yet. Run a refresh first."; return; fi
-    items+=( "back" "Back" )
-
-    choice="$(tui_menu "Logs" "Most recent log files in:\n$LOG_DIR" "${items[@]}")" || return
-    [[ "$choice" == "back" || -z "$choice" ]] && return
-    tui_textbox "$(basename "$choice")" "$choice"
-  done
-}
-
-tui_maint_menu() {
-  local choice
-  while true; do
-    choice="$(tui_menu "Maintenance" "Cache: $CACHE_DIR" \
-      reset  "Reset fingerprints (force recheck next refresh)" \
-      sync   "Re-upload local indexes to MinIO" \
-      prune  "Prune old log files (keep newest 100)" \
-      clear  "Clear ENTIRE shared-index cache" \
-      back   "Back")" || return
-
-    case "$choice" in
-      reset)  tui_yesno "Reset state" "Forget all fingerprints?\nThe next refresh will recheck every project." \
-                && { cmd_reset_state >/dev/null; tui_msg "Reset state" "Done. Next refresh rechecks all projects."; } ;;
-      sync)   local t; t="$(mktemp)"; s3_publish > "$t" 2>&1 && rm -f "$STATE_DIR/.needs_upload"; tui_textbox "Re-upload to MinIO" "$t"; rm -f "$t" ;;
-      prune)  local t; t="$(mktemp)"; cmd_prune_logs 100 > "$t" 2>&1; tui_textbox "Prune logs" "$t"; rm -f "$t" ;;
-      clear)  tui_yesno "Clear cache" "Delete the entire generated shared-index cache?\n\n$CACHE_DIR" \
-                && { cmd_clear_cache >/dev/null; tui_msg "Clear cache" "Cache cleared."; } ;;
-      back|"") return ;;
-    esac
-  done
-}
-
-# ---------------------------------------------------------------------------
-# Usage / dispatch
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# CLI dispatch
+# ===========================================================================
 
 usage() {
   cat <<EOF
-ijsi $IJSI_VERSION - JetBrains shared-index manager (MinIO/S3)
+ijsi $IJSI_VERSION - JetBrains shared-index manager for PHP API forks
 
-Run with no arguments to open the terminal GUI.
+Indexes a folder of forked PHP/Laravel repos (PhpStorm) and uploads the shared
+indexes to MinIO so the whole team skips analysing the project and its vendor/
+dependencies. Run with no arguments for the TUI.
 
-Commands:
-  (no args)         Open the terminal GUI (whiptail/dialog)
-  tui               Open the terminal GUI explicitly
-  refresh [opts]    Index new/changed projects, then upload to MinIO
-                      --force            re-index even if unchanged
-                      --only a,b,c       only projects whose name/path matches
-  s3 <sub>          MinIO/S3:  status | login | setup | sync | test | enable | disable
-  sync              Re-upload the local indexes to MinIO (no re-indexing)
-  boost <project>   Measure analysis-time speedup with vs. without indexes
-  list              List detected projects and their IDE
-  check | doctor    Show detected IDEs, CLI, roots, MinIO + server status
-  server            Start the local test HTTP server (foreground)
-  status            Show the local server systemd service status
-  logs              Show the newest refresh log
-  server-logs       Follow server logs (journalctl)
-  install-systemd   Install + enable the local test-server service
-  uninstall-systemd Remove ijsi systemd user services
-  config [sub]      show | path | init | edit   (manage $CONFIG_FILE)
-  reset-state [p]   Forget fingerprints (all, or one project) so they re-index
-  clear-cache       Delete the generated shared-index cache
-  prune-logs [N]    Keep newest N logs (default 100), delete the rest
-  version           Print ijsi + ij-shared-indexes-tool-cli version
-  help              Show this help
+USAGE
+  ijsi                         Open the terminal GUI
+  ijsi refresh [opts]          Update + index changed repos, then upload
+                                 --force, -f       re-index everything
+                                 --only a,b,...    only repos matching these names
+                                 --no-upload       index locally, skip the upload
+  ijsi s3 [sub]                MinIO: status | login | setup | sync | test
+  ijsi config [sub]            Config: show | path | init | edit
+  ijsi list                    List discovered repos
+  ijsi logs                    Show the newest run log
+  ijsi reset-state [name]      Forget fingerprints (all, or one repo)
+  ijsi prune-logs [keep]       Delete old logs, keep newest <keep> (default 100)
+  ijsi clear-cache             Remove the whole cache directory
+  ijsi check | doctor          Detected tools, PhpStorm, repos, MinIO readiness
+  ijsi version                 Print version
+  ijsi help                    This help
 
-MinIO quick start:
-  1) ijsi s3 login              # endpoint + access/secret -> stored in mc
-  2) set a bucket               # TUI: MinIO settings, or edit config S3_BUCKET
-  3) ijsi s3 enable             # turn on upload
-  4) ijsi s3 setup              # create bucket + grant anonymous download
-  5) ijsi refresh               # index + upload; commit each intellij.yaml
+QUICK START
+  1) ijsi config edit           # set REPOS_DIR (your folder of forks) + bucket
+  2) ijsi s3 login              # endpoint + access/secret -> stored in mc
+  3) ijsi s3 setup              # create bucket + grant anonymous download
+  4) ijsi refresh               # update, composer install, index, upload
+                                #   -> review & merge each "intellij.yaml fix" PR
 
-Configuration precedence:  built-in defaults  <  $CONFIG_FILE  <  IJSI_* env
+CONFIG
+  $CONFIG_FILE
+  Key vars: REPOS_DIR, PHPSTORM_IDE, DEFAULT_BRANCH, INTELLIJ_YAML_VCS,
+            S3_ALIAS/ENDPOINT/BUCKET/PREFIX, PUBLIC_BASE_URL.
+  Any IJSI_<VAR> environment variable overrides the config file.
 EOF
 }
 
@@ -1479,32 +1208,22 @@ main() {
   load_config
   apply_env_and_defaults
 
-  case "${1:-}" in
-    ""|tui|menu|ui)     shift 2>/dev/null || true; tui_main ;;
-    refresh)            shift; cmd_refresh "$@" ;;
-    s3)                 shift; cmd_s3 "$@" ;;
-    sync|publish)       s3_publish && rm -f "$STATE_DIR/.needs_upload" ;;
-    boost|evaluate)     shift; cmd_boost "$@" ;;
-    list)               cmd_list ;;
-    check|doctor)       cmd_check ;;
-    server)             cmd_server ;;
-    status)             cmd_status ;;
-    logs)               cmd_logs ;;
-    server-logs)        cmd_server_logs ;;
-    install-systemd)    cmd_install_systemd ;;
-    uninstall-systemd)  cmd_uninstall_systemd ;;
-    config)             shift; cmd_config "$@" ;;
-    reset-state)        shift; cmd_reset_state "$@" ;;
-    clear-cache)        cmd_clear_cache ;;
-    prune-logs)         shift; cmd_prune_logs "$@" ;;
-    version|-V|--version) cmd_version ;;
-    -h|--help|help)     usage ;;
-    *)
-      echo "Unknown command: $1" >&2
-      echo >&2
-      usage
-      exit 1
-      ;;
+  local cmd="${1:-}"; [[ $# -gt 0 ]] && shift
+  case "$cmd" in
+    "")                   tui_main ;;
+    tui|menu|ui)          tui_main ;;
+    refresh)              ensure_dirs; cmd_refresh "$@" ;;
+    s3)                   ensure_dirs; cmd_s3 "$@" ;;
+    config)               cmd_config "$@" ;;
+    list)                 cmd_list ;;
+    logs)                 cmd_logs ;;
+    reset-state)          ensure_dirs; cmd_reset_state "$@" ;;
+    prune-logs)           cmd_prune_logs "$@" ;;
+    clear-cache)          cmd_clear_cache ;;
+    check|doctor)         cmd_check ;;
+    version|-V|--version) echo "ijsi $IJSI_VERSION" ;;
+    help|-h|--help)       usage ;;
+    *)                    echo "ijsi: unknown command: $cmd" >&2; echo >&2; usage; exit 1 ;;
   esac
 }
 
